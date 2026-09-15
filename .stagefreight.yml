@@ -1,0 +1,103 @@
+# ------------------------------------------------------------------------------
+# GENERATED / ENFORCED BY STAGEFREIGHT GOVERNANCE
+# Source repo: PrPlanIT/MaintenancePolicy
+# Profile: prplanit-bin
+# This .stagefreight.yml is governed, not purely local.
+# To disable governance, detach from the control repo workflow.
+# Manual changes may be overwritten by reconciliation.
+# ------------------------------------------------------------------------------
+
+version: 1
+builds:
+  bin:
+    args:
+      - -ldflags
+      - -s -w -X github.com/PrPlanIT/CryoSheep/src/version.Version={version} -X github.com/PrPlanIT/CryoSheep/src/version.Commit={sha} -X github.com/PrPlanIT/CryoSheep/src/version.BuildDate={date}
+    builder: go
+    env:
+      CGO_ENABLED: "0"
+    from: ./cmd/cryosheep
+    kind: binary
+    output: cryosheep
+    platforms:
+      - linux/amd64
+      - linux/arm64
+scribe:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/scribe-go.yml
+lint:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/lint-flagships.yml
+security:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/security.yml
+dependency:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/dependency.yml
+commit:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/commit.yml
+release:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/release.yml
+manifest:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/manifest.yml
+build_cache:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/build_cache.yml
+ci:
+  forge:
+    - gitlab
+  image: docker.cr.pcfae.com/prplanit/stagefreight:latest-dev
+forges:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/forges.yml
+git:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/git.yml
+metadata:
+  category: infrastructure
+  description:
+    - Shuts a host and its guests down in order, on power loss or a normal reboot.
+    - 'Sequencer invoked by systemd on reboot and by upsmon when a UPS gives up: stops guests over ACPI so they shut down properly rather than being yanked, quiesces Ceph, arms the UPS''s own power-off as a backstop, and journals every decision locally so an outage can be reconstructed once logging is back.'
+  license: MIT
+  org: PrPlanIT
+  title: CryoSheep
+  topics:
+    - ups
+    - nut
+    - shutdown
+    - proxmox
+    - ceph
+    - kubernetes
+    - homelab
+orgs:
+  PrPlanIT:
+    aliases:
+      docker: prplanit
+      ghcr: prplanit
+      github: PrPlanIT
+      handle: prplanit
+    maintainer: PrPlanIT <precisionplanit@gmail.com>
+publish:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/publish-binary.yml
+registries:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/registries.yml
+repos:
+  github-mirror:
+    forge: github
+    project: PrPlanIT/CryoSheep
+    roles:
+      - mirror
+      - publish-origin
+    sync:
+      git: true
+      releases: true
+  primary:
+    branches:
+      default: main
+    forge: gitlab
+    project: PrPlanIT/CryoSheep
+    roles:
+      - primary
+    worktree: .
+stencils:
+  presets:
+    - https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/stencils-base.yml
+    - https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/stencils-status.yml
+    - https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/stencils-go.yml
+test:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/test-go.yml
+toolchains:
+  preset: https://gitlab.prplanit.com/PrPlanIT/MaintenancePolicy//preset/toolchains.yml
