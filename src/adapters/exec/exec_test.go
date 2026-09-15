@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/PrPlanIT/CryoSheep/src/core"
 )
 
 func fake(out string, err error) *Runner {
@@ -99,4 +101,51 @@ func contains(hay, needle string) bool {
 		}
 		return false
 	})()
+}
+
+func TestParseStartupOrder(t *testing.T) {
+	const cfg = `boot: order=scsi0
+cores: 4
+memory: 8192
+name: pfSense-z-1
+startup: order=1,up=30,down=120
+scsi0: local-lvm:vm-100-disk-0,size=32G
+`
+	if got := ParseStartupOrder(cfg); got != 1 {
+		t.Fatalf("order = %d, want 1", got)
+	}
+}
+
+// `boot: order=scsi0` is a different field entirely and must not be mistaken
+// for a startup order — reading it would invent a priority nobody set.
+func TestBootOrderIsNotStartupOrder(t *testing.T) {
+	const cfg = `boot: order=scsi0;net0
+cores: 4
+name: scratch
+`
+	if got := ParseStartupOrder(cfg); got != core.OrderUnset {
+		t.Fatalf("order = %d, want unset — `boot:` is not `startup:`", got)
+	}
+}
+
+func TestStartupWithoutOrderIsUnset(t *testing.T) {
+	if got := ParseStartupOrder("startup: up=30,down=120\nname: x\n"); got != core.OrderUnset {
+		t.Fatalf("order = %d, want unset", got)
+	}
+}
+
+func TestMissingStartupIsUnset(t *testing.T) {
+	if got := ParseStartupOrder("cores: 2\nname: x\n"); got != core.OrderUnset {
+		t.Fatalf("order = %d, want unset", got)
+	}
+}
+
+// A guest from qm list carries no order until its config has been read.
+func TestQMListLeavesOrderUnset(t *testing.T) {
+	g, _ := ParseQMList(qmListSample)
+	for _, x := range g {
+		if x.Order != core.OrderUnset {
+			t.Fatalf("guest %s came out of qm list with order %d", x.ID, x.Order)
+		}
+	}
 }

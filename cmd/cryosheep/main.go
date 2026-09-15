@@ -73,18 +73,34 @@ func runPlan(args []string) int {
 	defer cancel()
 
 	p, _, _ := f.build(ctx)
-	render(p)
+
+	// The worst case is what has to fit, not the typical one.
+	var runtime time.Duration
+	if f.upsAddr != "" {
+		if d, err := nut.New(f.upsAddr, f.upsName).Runtime(ctx); err == nil {
+			runtime = d
+		}
+	}
+	render(p, runtime)
 	return 0
 }
 
-func render(p plan.Plan) {
+func render(p plan.Plan, runtime time.Duration) {
 	fmt.Printf("host:  %s\n", p.Host)
 	fmt.Printf("roles: %s\n", join(p.Roles))
 	fmt.Printf("ups:   %s\n", p.UPSStatus)
+	ordered := 0
 	if len(p.Guests) > 0 {
 		fmt.Println("guests:")
 		for _, g := range p.Guests {
-			fmt.Printf("  %-6s %-24s %s\n", g.ID, g.Name, g.Status)
+			order := "-"
+			if g.Order != core.OrderUnset && g.Order != 0 {
+				order = fmt.Sprintf("order=%d", g.Order)
+				if g.Running() {
+					ordered++
+				}
+			}
+			fmt.Printf("  %-6s %-24s %-9s %s\n", g.ID, g.Name, g.Status, order)
 		}
 	}
 	fmt.Println("plan:")
@@ -108,6 +124,38 @@ func render(p plan.Plan) {
 	}
 	if pnr < len(p.Steps) {
 		fmt.Printf("\npoint of no return: step %d — power returning before it aborts and reverses\n", pnr+1)
+	}
+
+	// Guests stop in reverse startup order. With none set the order is whatever
+	// qm list returned, which is VMID ascending — so a firewall on a low VMID
+	// would be the first thing stopped.
+	running := 0
+	for _, g := range p.Guests {
+		if g.Running() {
+			running++
+		}
+	}
+	if running > 0 && ordered == 0 {
+		fmt.Printf("\nno guest declares `startup: order=` — they will stop in VMID order.\n" +
+			"  set it in Proxmox to control this: order=1 boots first and stops last.\n")
+	}
+
+	// Worst case has to fit inside the battery, not the typical case.
+	var worst time.Duration
+	for _, s := range p.Steps {
+		worst += s.Timeout
+	}
+	if worst > 0 {
+		line := fmt.Sprintf("\nworst case: %s", worst)
+		if runtime > 0 {
+			line += fmt.Sprintf("   battery now: %s", runtime)
+		}
+		fmt.Println(line)
+		if runtime > 0 && worst > runtime {
+			fmt.Printf("  WARNING: the sequence cannot complete at this load — %s short.\n"+
+				"  shorten --guest-timeout, stop non-critical guests earlier, or rely on the UPS deadline.\n",
+				worst-runtime)
+		}
 	}
 }
 

@@ -29,11 +29,20 @@ var RoleUnits = map[Role]string{
 	RoleKubelet: "kubelet.service",
 }
 
+// OrderUnset marks a guest with no Proxmox startup order.
+const OrderUnset = -1
+
 // Guest is a virtual machine on this host.
 type Guest struct {
 	ID     string
 	Name   string
 	Status string // "running", "stopped", ...
+
+	// Order is Proxmox's own startup order, from `startup: order=N`.
+	// CryoSheep reads it rather than keeping a second list: Proxmox already
+	// honours this field when it starts and stops guests itself, and two
+	// sources of truth for the same ordering would silently disagree.
+	Order int
 }
 
 func (g Guest) Running() bool { return g.Status == "running" }

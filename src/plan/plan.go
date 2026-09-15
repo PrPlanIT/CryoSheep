@@ -9,6 +9,7 @@
 package plan
 
 import (
+	"sort"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/core"
@@ -65,6 +66,38 @@ type Plan struct {
 	Steps     []Step
 }
 
+// shutdownOrder returns the running guests in the order they should be stopped.
+//
+// Proxmox starts guests in ascending `startup: order=` and stops them in the
+// reverse, so the first thing up is the last thing down. Guests with no order
+// start last and therefore stop first, which is also what you want: an
+// unordered guest is one nobody declared important.
+//
+// This is why the field is read rather than duplicated. A firewall or DNS guest
+// given order=1 boots first and survives longest, and that single value governs
+// both directions — no second list to drift out of step with it.
+func shutdownOrder(guests []core.Guest) []core.Guest {
+	var running []core.Guest
+	for _, g := range guests {
+		if g.Running() {
+			running = append(running, g)
+		}
+	}
+	sort.SliceStable(running, func(i, j int) bool {
+		a, b := running[i], running[j]
+		au := a.Order == core.OrderUnset || a.Order == 0
+		bu := b.Order == core.OrderUnset || b.Order == 0
+		if au != bu {
+			return au // unordered guests stop first
+		}
+		if au {
+			return false // both unordered: keep qm list order
+		}
+		return a.Order > b.Order // ordered: highest stops first, order=1 last
+	})
+	return running
+}
+
 // PointOfNoReturn is the index of the first step that cannot be reversed, or
 // len(Steps) when every step can. Steps before it are gated on UPS state.
 func (p Plan) PointOfNoReturn() int {
@@ -117,10 +150,7 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 		})
 	}
 
-	for _, g := range guests {
-		if !g.Running() {
-			continue
-		}
+	for _, g := range shutdownOrder(guests) {
 		p.Steps = append(p.Steps, Step{
 			Action:  ActionGuestStop,
 			Target:  g.ID,

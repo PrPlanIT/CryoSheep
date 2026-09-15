@@ -14,6 +14,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,13 +40,54 @@ func (r *Runner) IsActive(ctx context.Context, unit string) (bool, error) {
 	return strings.TrimSpace(string(out)) == "active", nil
 }
 
-// Guests lists this host's VMs by parsing `qm list`.
+// Guests lists this host's VMs, with each running guest's Proxmox startup order.
+//
+// The order needs a second call per guest: `qm list` does not carry it. Only
+// running guests are asked, since a stopped one produces no step.
 func (r *Runner) Guests(ctx context.Context) ([]core.Guest, error) {
 	out, err := r.Run(ctx, "qm", "list")
 	if err != nil {
 		return nil, fmt.Errorf("qm list: %w", err)
 	}
-	return ParseQMList(string(out))
+	guests, err := ParseQMList(string(out))
+	if err != nil {
+		return nil, err
+	}
+	for i := range guests {
+		if !guests[i].Running() {
+			continue
+		}
+		cfg, err := r.Run(ctx, "qm", "config", guests[i].ID)
+		if err != nil {
+			continue // unreadable config means unordered, not fatal
+		}
+		guests[i].Order = ParseStartupOrder(string(cfg))
+	}
+	return guests, nil
+}
+
+// ParseStartupOrder reads `startup: order=N,up=X,down=Y` from `qm config`.
+// Returns core.OrderUnset when the guest has no declared order.
+func ParseStartupOrder(cfg string) int {
+	sc := bufio.NewScanner(strings.NewReader(cfg))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "startup:") {
+			continue
+		}
+		for _, part := range strings.Split(strings.TrimPrefix(line, "startup:"), ",") {
+			part = strings.TrimSpace(part)
+			if !strings.HasPrefix(part, "order=") {
+				continue
+			}
+			n, err := strconv.Atoi(strings.TrimPrefix(part, "order="))
+			if err != nil {
+				return core.OrderUnset
+			}
+			return n
+		}
+	}
+	return core.OrderUnset
 }
 
 // ParseQMList reads the fixed-column output of `qm list`. Exported so the parser
@@ -67,7 +109,9 @@ func ParseQMList(out string) ([]core.Guest, error) {
 		if !isNumeric(fields[0]) {
 			continue
 		}
-		guests = append(guests, core.Guest{ID: fields[0], Name: fields[1], Status: fields[2]})
+		guests = append(guests, core.Guest{
+			ID: fields[0], Name: fields[1], Status: fields[2], Order: core.OrderUnset,
+		})
 	}
 	return guests, sc.Err()
 }

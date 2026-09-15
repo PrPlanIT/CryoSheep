@@ -99,3 +99,67 @@ func TestGuestTimeoutDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("override guest timeout = %v, want 30s", p.Steps[0].Timeout)
 	}
 }
+
+// Proxmox stops guests in reverse startup order, so order=1 — the firewall, the
+// resolver — is the last thing down. Getting this backwards would take the
+// network out at the start of a sequence that still has work to do.
+func TestGuestsStopInReverseStartupOrder(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "100", Name: "pfSense", Status: "running", Order: 1},
+		{ID: "105", Name: "k8s-a", Status: "running", Order: 5},
+		{ID: "106", Name: "k8s-b", Status: "running", Order: 5},
+		{ID: "707", Name: "dock", Status: "running", Order: 9},
+	}
+	p := Build("avocado", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{})
+	var got []string
+	for _, s := range p.Steps {
+		if s.Action == ActionGuestStop {
+			got = append(got, s.Detail)
+		}
+	}
+	want := []string{"dock", "k8s-a", "k8s-b", "pfSense"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stop order = %v, want %v (order=1 last)", got, want)
+		}
+	}
+}
+
+// A guest nobody declared important stops before one that was.
+func TestUnorderedGuestsStopFirst(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "100", Name: "pfSense", Status: "running", Order: 1},
+		{ID: "500", Name: "scratch", Status: "running", Order: core.OrderUnset},
+		{ID: "501", Name: "scratch2", Status: "running", Order: 0},
+	}
+	p := Build("h", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{})
+	var got []string
+	for _, s := range p.Steps {
+		if s.Action == ActionGuestStop {
+			got = append(got, s.Detail)
+		}
+	}
+	if got[len(got)-1] != "pfSense" {
+		t.Fatalf("stop order = %v, want pfSense last", got)
+	}
+}
+
+// With nothing ordered, qm list order is preserved rather than shuffled.
+func TestNoOrdersPreservesListOrder(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "100", Name: "a", Status: "running", Order: core.OrderUnset},
+		{ID: "105", Name: "b", Status: "running", Order: core.OrderUnset},
+		{ID: "707", Name: "c", Status: "running", Order: core.OrderUnset},
+	}
+	p := Build("h", nil, guests, core.StatusOnBattery, Options{})
+	want := []string{"a", "b", "c"}
+	i := 0
+	for _, s := range p.Steps {
+		if s.Action == ActionGuestStop {
+			if s.Detail != want[i] {
+				t.Fatalf("order changed with no startup values: got %s want %s", s.Detail, want[i])
+			}
+			i++
+		}
+	}
+}
