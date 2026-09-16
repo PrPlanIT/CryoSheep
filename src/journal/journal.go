@@ -167,8 +167,15 @@ func (w *Writer) Close(complete, aborted bool) error {
 	return err
 }
 
-// flush writes the whole record atomically, so a crash mid-write can never leave
-// a half-parsed file where calibration expects data.
+// flush writes the whole record atomically and durably.
+//
+// Atomic alone is not enough here. A rename is ordered against its own data on
+// most filesystems, but nothing forces either to the platter, and this package
+// exists to survive the loss of power — the one failure that empties the page
+// cache. Without the syncs below the record is present and empty exactly when
+// it is needed: after a UPS cut the sequence did not survive. So the temp file
+// is synced before the rename, and the directory after it, which is what makes
+// the entry itself durable rather than merely written.
 func (w *Writer) flush() error {
 	if w.run.Steps == nil {
 		w.run.Steps = []Step{} // [] rather than null: consumers should not special-case
@@ -178,10 +185,44 @@ func (w *Writer) flush() error {
 		return err
 	}
 	tmp := w.path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
+	if err := writeSync(tmp, append(b, '\n')); err != nil {
 		return err
 	}
-	return os.Rename(tmp, w.path)
+	if err := os.Rename(tmp, w.path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(w.path))
+}
+
+// writeSync writes a file and forces it to disk before returning.
+func writeSync(path string, b []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir forces a directory entry to disk, so the renamed-into-place name
+// survives a power cut and not just the bytes it points at.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func truncate(s string, n int) string {
