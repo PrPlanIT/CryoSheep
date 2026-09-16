@@ -206,7 +206,7 @@ func TestKubeletNodeGetsItsOwnTeardown(t *testing.T) {
 	for _, s := range p.Steps {
 		got = append(got, s.Action)
 	}
-	want := []Action{ActionK8sCordon, ActionK8sDrain, ActionK8sUnmount, ActionHostHalt}
+	want := []Action{ActionK8sRecord, ActionK8sCordon, ActionK8sUnmount, ActionHostHalt}
 	if len(got) != len(want) {
 		t.Fatalf("steps = %v, want %v", got, want)
 	}
@@ -223,7 +223,7 @@ func TestCordonAndDrainAreReversible(t *testing.T) {
 	p := Build("node", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{})
 	for _, s := range p.Steps {
 		switch s.Action {
-		case ActionK8sCordon, ActionK8sDrain:
+		case ActionK8sRecord, ActionK8sCordon:
 			if !s.Reversible {
 				t.Fatalf("%s must be reversible", s.Action)
 			}
@@ -241,23 +241,8 @@ func TestHypervisorGetsNoKubeSteps(t *testing.T) {
 		[]core.Guest{{ID: "100", Status: "running"}}, core.StatusOnBattery, Options{})
 	for _, s := range p.Steps {
 		switch s.Action {
-		case ActionK8sCordon, ActionK8sDrain, ActionK8sUnmount:
+		case ActionK8sRecord, ActionK8sCordon, ActionK8sUnmount:
 			t.Fatalf("hypervisor plan contains %s", s.Action)
-		}
-	}
-}
-
-func TestDrainTimeoutDefaultsAndOverrides(t *testing.T) {
-	p := Build("n", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{})
-	for _, s := range p.Steps {
-		if s.Action == ActionK8sDrain && s.Timeout != 60*time.Second {
-			t.Fatalf("drain timeout = %v, want 60s", s.Timeout)
-		}
-	}
-	p = Build("n", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{DrainTimeout: 20 * time.Second})
-	for _, s := range p.Steps {
-		if s.Action == ActionK8sDrain && s.Timeout != 20*time.Second {
-			t.Fatalf("drain timeout = %v, want 20s", s.Timeout)
 		}
 	}
 }

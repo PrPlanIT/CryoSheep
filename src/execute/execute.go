@@ -22,6 +22,7 @@ package execute
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/core"
@@ -35,12 +36,14 @@ import (
 type Recorder interface {
 	StepStart(action, target, gate string) int
 	StepEnd(i int, outcome string, err error)
+	Note(i int, note string)
 }
 
 type nopRecorder struct{}
 
 func (nopRecorder) StepStart(string, string, string) int { return 0 }
 func (nopRecorder) StepEnd(int, string, error)           {}
+func (nopRecorder) Note(int, string)                     {}
 
 type Executor struct {
 	Hyp      core.Hypervisor
@@ -109,7 +112,7 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 		}
 
 		idx := rec.StepStart(string(step.Action), step.Target, gate)
-		outcome, err := e.perform(ctx, step)
+		outcome, err := e.performAt(ctx, step, rec, idx)
 		rec.StepEnd(idx, outcome, err)
 		res.Ran++
 
@@ -159,6 +162,45 @@ func (e *Executor) now() time.Time {
 	return time.Now()
 }
 
+// performAt runs a step, letting it attach evidence to its own journal entry.
+func (e *Executor) performAt(ctx context.Context, s plan.Step, rec Recorder, idx int) (string, error) {
+	if s.Action == plan.ActionK8sRecord {
+		if e.Kube == nil {
+			return journal.OutcomeSkipped, nil
+		}
+		pods, err := e.Kube.StatefulPods(ctx, s.Target)
+		if err != nil {
+			return journal.OutcomeFailed, err
+		}
+		rec.Note(idx, describePods(pods))
+		return journal.OutcomeDone, nil
+	}
+	return e.perform(ctx, s)
+}
+
+// describePods renders the record compactly: one workload per line, role first
+// so the authoritative ones are findable by eye in an incident.
+func describePods(pods []core.StatefulPod) string {
+	if len(pods) == 0 {
+		return "no stateful workloads on this node"
+	}
+	var b strings.Builder
+	for i, p := range pods {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		role := p.Role
+		if role == "" {
+			role = "-"
+		}
+		b.WriteString(role + " " + p.Namespace + "/" + p.Name)
+		if p.Owner != "" {
+			b.WriteString(" (" + p.Owner + ")")
+		}
+	}
+	return b.String()
+}
+
 func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 	if e.DryRun {
 		return journal.OutcomeSkipped, nil
@@ -184,15 +226,6 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 		}
 		if err := e.Kube.Cordon(ctx, s.Target); err != nil {
 			return journal.OutcomeFailed, err
-		}
-	case plan.ActionK8sDrain:
-		if e.Kube == nil {
-			return journal.OutcomeSkipped, nil
-		}
-		// A pod that will not evict must not hold the sequence open. The node is
-		// going down either way; the bound decides whether it goes tidily.
-		if err := e.Kube.Drain(ctx, s.Target, s.Timeout); err != nil {
-			return journal.OutcomeForced, err
 		}
 	case plan.ActionK8sUnmount:
 		if e.Kube == nil {
@@ -320,8 +353,8 @@ func (e *Executor) undoFor(a plan.Action) func(context.Context) error {
 			return nil
 		}
 		return e.Ceph.UnsetNoout
-	case plan.ActionK8sDrain:
-		return nil // uncordoning is what brings workloads back; draining has no separate undo
+	case plan.ActionK8sRecord:
+		return nil // reading state changes nothing, so there is nothing to undo
 	}
 	return nil
 }

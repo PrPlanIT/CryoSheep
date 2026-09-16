@@ -66,8 +66,8 @@ func (f *fakeDeadline) Cancel(context.Context) error             { f.cancelled++
 func (f *fakeHost) Poweroff(context.Context) error { f.halted++; return nil }
 
 type recStep struct {
-	action, target, gate, outcome string
-	failed                        bool
+	action, target, gate, outcome, note string
+	failed                              bool
 }
 
 type recorder struct{ steps []recStep }
@@ -80,6 +80,7 @@ func (r *recorder) StepEnd(i int, outcome string, err error) {
 	r.steps[i].outcome = outcome
 	r.steps[i].failed = err != nil
 }
+func (r *recorder) Note(i int, note string) { r.steps[i].note = note }
 
 func testPlan() plan.Plan {
 	return plan.Build("eggplant",

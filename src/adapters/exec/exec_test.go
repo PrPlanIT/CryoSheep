@@ -224,22 +224,51 @@ func TestCSIMountsHandlesEmptyOutput(t *testing.T) {
 	}
 }
 
-func TestDrainIsBoundedAndForces(t *testing.T) {
-	var got []string
-	r := &Runner{Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
-		got = append([]string{name}, args...)
-		return nil, nil
-	}}
-	if err := r.Drain(context.Background(), "dungeon-chest-001", 45*time.Second); err != nil {
+const podsJSON = `{"items":[
+ {"metadata":{"name":"pg-1","namespace":"db","labels":{"cnpg.io/instanceRole":"primary"},
+   "ownerReferences":[{"kind":"Cluster","name":"pg"}]}},
+ {"metadata":{"name":"pg-2","namespace":"db","labels":{"cnpg.io/instanceRole":"replica"},
+   "ownerReferences":[{"kind":"Cluster","name":"pg"}]}},
+ {"metadata":{"name":"loki-0","namespace":"obs","labels":{},
+   "ownerReferences":[{"kind":"StatefulSet","name":"loki"}]}},
+ {"metadata":{"name":"nginx-abc","namespace":"web","labels":{},
+   "ownerReferences":[{"kind":"ReplicaSet","name":"nginx"}]}}
+]}`
+
+// The record exists so a revival knows who held authority. A primary must be
+// distinguishable from a replica in it.
+func TestParseStatefulPodsKeepsRoles(t *testing.T) {
+	got, err := ParseStatefulPods([]byte(podsJSON))
+	if err != nil {
 		t.Fatal(err)
 	}
-	joined := ""
-	for _, a := range got {
-		joined += a + " "
+	if len(got) != 3 {
+		t.Fatalf("recorded %d pods, want 3 stateful ones: %+v", len(got), got)
 	}
-	for _, want := range []string{"kubectl drain dungeon-chest-001", "--timeout 45s", "--force", "--ignore-daemonsets"} {
-		if !contains(joined, want) {
-			t.Fatalf("drain called as %q, missing %q", joined, want)
+	var primary string
+	for _, p := range got {
+		if p.Role == "primary" {
+			primary = p.Namespace + "/" + p.Name
 		}
+	}
+	if primary != "db/pg-1" {
+		t.Fatalf("primary recorded as %q, want db/pg-1", primary)
+	}
+}
+
+// A stateless pod reschedules and its identity neither survives nor matters.
+func TestParseStatefulPodsSkipsStateless(t *testing.T) {
+	got, _ := ParseStatefulPods([]byte(podsJSON))
+	for _, p := range got {
+		if p.Name == "nginx-abc" {
+			t.Fatal("a ReplicaSet pod was recorded")
+		}
+	}
+}
+
+func TestParseStatefulPodsEmpty(t *testing.T) {
+	got, err := ParseStatefulPods([]byte(`{"items":[]}`))
+	if err != nil || len(got) != 0 {
+		t.Fatalf("got %v, %v", got, err)
 	}
 }

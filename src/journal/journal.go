@@ -43,6 +43,10 @@ const (
 // kilobyte record into a megabyte one.
 const maxErr = 200
 
+// maxNote bounds recorded evidence. Generous enough for the stateful workloads
+// of one node, small enough that a run stays a kilobyte.
+const maxNote = 2000
+
 // KeepDefault is how many runs are retained. Enough for calibration to have a
 // distribution, few enough that the directory never needs thinking about.
 const KeepDefault = 20
@@ -55,6 +59,11 @@ type Step struct {
 	Elapsed time.Duration `json:"elapsed"`
 	Outcome string        `json:"outcome"`
 	Err     string        `json:"err,omitempty"`
+
+	// Note carries evidence a step gathered — which workloads held authority on
+	// this node, for instance. Bounded like Err: a record is for reading later,
+	// not a dumping ground.
+	Note string `json:"note,omitempty"`
 }
 
 type Run struct {
@@ -120,6 +129,15 @@ func (w *Writer) StepStart(action, target, gate string) int {
 	})
 	_ = w.flush()
 	return len(w.run.Steps) - 1
+}
+
+// Note attaches evidence to a step.
+func (w *Writer) Note(i int, note string) {
+	if i < 0 || i >= len(w.run.Steps) {
+		return
+	}
+	w.run.Steps[i].Note = truncate(note, maxNote)
+	_ = w.flush()
 }
 
 func (w *Writer) StepEnd(i int, outcome string, err error) {

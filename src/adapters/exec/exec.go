@@ -12,6 +12,7 @@ package exec
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -182,23 +183,75 @@ func (r *Runner) Uncordon(ctx context.Context, node string) error {
 	return nil
 }
 
-// Drain evicts this node's pods within a bound.
-//
-// --force and --delete-emptydir-data are deliberate: a node being powered off
-// cannot honour a pod that has nowhere to go, and refusing to proceed would
-// leave it running until the battery decided instead.
-func (r *Runner) Drain(ctx context.Context, node string, timeout time.Duration) error {
-	secs := int(timeout.Seconds())
-	if secs <= 0 {
-		secs = 60
-	}
-	_, err := r.Run(ctx, "kubectl", "drain", node,
-		"--ignore-daemonsets", "--delete-emptydir-data", "--force",
-		"--timeout", fmt.Sprintf("%ds", secs))
+// StatefulPods lists the stateful workloads on this node and the role each
+// claims, so a revival has something to start from.
+func (r *Runner) StatefulPods(ctx context.Context, node string) ([]core.StatefulPod, error) {
+	out, err := r.Run(ctx, "kubectl", "get", "pods", "--all-namespaces",
+		"--field-selector", "spec.nodeName="+node, "-o", "json")
 	if err != nil {
-		return fmt.Errorf("kubectl drain %s: %w", node, err)
+		return nil, fmt.Errorf("kubectl get pods: %w", err)
 	}
-	return nil
+	return ParseStatefulPods(out)
+}
+
+// roleLabels are where workloads publish which instance is authoritative. CNPG
+// writes cnpg.io/instanceRole; others use their own, so several are read and the
+// first present wins.
+var roleLabels = []string{
+	"cnpg.io/instanceRole",
+	"role",
+	"app.kubernetes.io/component",
+	"statefulset.kubernetes.io/pod-name",
+}
+
+// ParseStatefulPods picks the workloads worth recording out of `kubectl get
+// pods -o json`: anything owned by a StatefulSet, and anything that publishes a
+// role. Stateless pods are omitted — they reschedule and their identity does not
+// survive or need to.
+func ParseStatefulPods(data []byte) ([]core.StatefulPod, error) {
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name            string            `json:"name"`
+				Namespace       string            `json:"namespace"`
+				Labels          map[string]string `json:"labels"`
+				OwnerReferences []struct {
+					Kind string `json:"kind"`
+					Name string `json:"name"`
+				} `json:"ownerReferences"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("parse pods: %w", err)
+	}
+
+	var out []core.StatefulPod
+	for _, it := range list.Items {
+		m := it.Metadata
+		owner := ""
+		stateful := false
+		for _, o := range m.OwnerReferences {
+			if o.Kind == "StatefulSet" || o.Kind == "Cluster" {
+				owner, stateful = o.Kind+"/"+o.Name, true
+				break
+			}
+		}
+		role := ""
+		for _, k := range roleLabels {
+			if v, ok := m.Labels[k]; ok && v != "" && k != "statefulset.kubernetes.io/pod-name" {
+				role = v
+				break
+			}
+		}
+		if !stateful && role == "" {
+			continue
+		}
+		out = append(out, core.StatefulPod{
+			Namespace: m.Namespace, Name: m.Name, Owner: owner, Role: role,
+		})
+	}
+	return out, nil
 }
 
 // UnmountCSI releases Ceph and CSI mounts before the network goes.

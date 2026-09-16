@@ -120,10 +120,33 @@ type Ceph interface {
 // rather than evicted, and CSI mounts that cannot be unmounted stall systemd for
 // TimeoutStopSec each — which is why a node that should stop in seconds takes
 // minutes.
+// StatefulPod is a workload whose identity matters when it comes back.
+//
+// Role is what the workload calls itself — CNPG writes primary/replica, Galera
+// and others use their own vocabulary. It is recorded verbatim rather than
+// normalised: the value is evidence for a human or a later revival, not
+// something CryoSheep interprets.
+type StatefulPod struct {
+	Namespace string
+	Name      string
+	Owner     string // controlling StatefulSet or Cluster, where there is one
+	Role      string // e.g. "primary", "replica", or empty
+}
+
 type Kube interface {
 	Cordon(ctx context.Context, node string) error
 	Uncordon(ctx context.Context, node string) error
-	Drain(ctx context.Context, node string, timeout time.Duration) error
+
+	// StatefulPods lists the stateful workloads on this node and the role each
+	// claims, read before anything is stopped.
+	//
+	// This is the record a revival needs. A quorum service elects from what it
+	// finds on disk, and the node that stopped last cleanly is usually the one
+	// to start from — Galera writes safe_to_bootstrap for exactly this, but only
+	// on a clean stop. If a node is forced off, nothing local says who was
+	// authoritative. A journal that says which instance held primary, on which
+	// node, at what time, is what makes the answer knowable afterwards.
+	StatefulPods(ctx context.Context, node string) ([]StatefulPod, error)
 
 	// UnmountCSI releases Ceph and CSI mounts before the network goes, returning
 	// how many it released. Left mounted, each one is a unit systemd waits on
