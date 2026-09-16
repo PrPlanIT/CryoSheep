@@ -31,12 +31,14 @@ func main() {
 	switch os.Args[1] {
 	case "plan":
 		os.Exit(runPlan(os.Args[2:]))
-	case "quiesce":
-		os.Exit(runQuiesce(os.Args[2:]))
-	case "restore":
-		os.Exit(runRestore(os.Args[2:]))
-	case "halt":
-		os.Exit(runHalt(os.Args[2:]))
+	case "settle":
+		os.Exit(runSettle(os.Args[2:]))
+	case "sleep":
+		os.Exit(runSleep(os.Args[2:]))
+	case "cancel":
+		os.Exit(runCancel(os.Args[2:]))
+	case "wake":
+		os.Exit(runWake(os.Args[2:]))
 	case "report":
 		os.Exit(runReport(os.Args[2:]))
 	case "calibrate":
@@ -50,14 +52,15 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `cryosheep — orderly host shutdown
+	fmt.Fprint(os.Stderr, `cryosheep — put a machine into stasis, and bring it back
 
-  plan       show what would happen on this host, changing nothing
-  quiesce    perform the reversible prefix        (upsmon NOTIFYCMD, ONBATT)
-  restore    undo the last quiesce                (upsmon NOTIFYCMD, ONLINE)
-  halt       perform the whole sequence, ungated  (upsmon SHUTDOWNCMD / systemd)
+  plan       show what would happen here, changing nothing
+  settle     begin winding down, reversibly       (upsmon NOTIFYCMD, ONBATT)
+  sleep      put this machine into stasis         (upsmon SHUTDOWNCMD / systemd)
+  cancel     abandon a sleep and undo it          (upsmon NOTIFYCMD, ONLINE)
+  wake       revive after stasis and ship records (on boot)
   report     emit undelivered run journals, once
-  calibrate  recommend a shutdown trigger from what past runs actually cost
+  calibrate  recommend a threshold from what past runs actually cost
   version    build identity
 
 `)

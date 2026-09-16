@@ -1,1 +1,8 @@
+# --- secrets / credentials — NEVER commit ---
+*vault-keys*
+*.key
+*.pem
+*.secret
+*token*
+
 .build/

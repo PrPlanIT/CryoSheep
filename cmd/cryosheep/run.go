@@ -104,11 +104,11 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	return p, e, runner
 }
 
-// runQuiesce performs only the reversible prefix — what can be given back if
+// runSettle performs only the reversible prefix — what can be given back if
 // mains return. Invoked from upsmon's NOTIFYCMD on ONBATT, while the budget is
 // still abundant and nothing has been committed.
-func runQuiesce(args []string) int {
-	fs := flag.NewFlagSet("quiesce", flag.ExitOnError)
+func runSettle(args []string) int {
+	fs := flag.NewFlagSet("settle", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
 	_ = fs.Parse(args)
@@ -119,7 +119,7 @@ func runQuiesce(args []string) int {
 	p, e, _ := f.build(ctx)
 	p.Steps = p.Steps[:p.PointOfNoReturn()] // reversible prefix only
 	if len(p.Steps) == 0 {
-		fmt.Println("nothing to quiesce on this host")
+		fmt.Println("nothing to settle on this host")
 		return 0
 	}
 
@@ -135,20 +135,20 @@ func runQuiesce(args []string) int {
 		_ = w.Close(res.Completed, res.Aborted)
 	}
 	if res.Aborted {
-		fmt.Printf("quiesce: stopped before acting — UPS reports %q, so there is nothing to quiesce (reversed %d)\n",
+		fmt.Printf("settle: stopped before acting — UPS reports %q, so there is nothing to settle (reversed %d)\n",
 			res.Gate, res.Reversed)
 		return 0
 	}
-	fmt.Printf("quiesce: ran %d step(s)\n", res.Ran)
+	fmt.Printf("settle: ran %d step(s)\n", res.Ran)
 	return 0
 }
 
-// runRestore undoes the last quiesce. Invoked from NOTIFYCMD on ONLINE.
+// runCancel abandons a sleep in progress and undoes what it did. Invoked from NOTIFYCMD on ONLINE.
 //
 // It reverses what the journal says this host actually did, not everything it
 // could have done — a noout an operator set for maintenance is not ours to clear.
-func runRestore(args []string) int {
-	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+func runCancel(args []string) int {
+	fs := flag.NewFlagSet("cancel", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
 	_ = fs.Parse(args)
@@ -158,61 +158,24 @@ func runRestore(args []string) int {
 
 	runs, err := journal.Load(f.runsDir)
 	if err != nil || len(runs) == 0 {
-		fmt.Println("restore: no run to undo")
+		fmt.Println("cancel: no run to undo")
 		return 0
 	}
 	last := runs[0]
 
-	runner := exec.New()
-	var ups *nut.Client
-	if f.upsAddr != "" {
-		ups = nut.New(f.upsAddr, f.upsName)
-		ups.User, ups.Pass = f.upsUser, f.password()
-	}
-
-	undone := 0
-	for i := len(last.Steps) - 1; i >= 0; i-- {
-		s := last.Steps[i]
-		if s.Outcome != journal.OutcomeDone {
-			continue
-		}
-		var undo func() error
-		switch s.Action {
-		case string(plan.ActionUPSDeadline):
-			// Cancelling the armed power-off is the most urgent undo: left
-			// standing, the UPS cuts power even though mains came back.
-			if ups != nil {
-				undo = func() error { return ups.Cancel(ctx) }
-			}
-		case string(plan.ActionCephNoout):
-			undo = func() error { return runner.UnsetNoout(ctx) }
-		}
-		if undo == nil {
-			continue
-		}
-		if f.dryRun {
-			fmt.Printf("restore: would undo %s (from run %s)\n", s.Action, last.ID)
-			undone++
-			continue
-		}
-		if err := undo(); err != nil {
-			fmt.Fprintf(os.Stderr, "restore: %s: %v\n", s.Action, err)
-			continue
-		}
-		undone++
-	}
-	fmt.Printf("restore: undid %d step(s) from run %s\n", undone, last.ID)
+	undone := undoRun(ctx, f, last)
+	fmt.Printf("cancel: undid %d step(s) from run %s\n", undone, last.ID)
 	return 0
 }
 
-// runHalt performs the whole sequence. Invoked from upsmon's SHUTDOWNCMD, and
+// runSleep performs the whole sequence. Invoked from upsmon's SHUTDOWNCMD, and
 // from systemd on a normal reboot.
 //
 // Ungated on purpose. SHUTDOWNCMD is terminal in NUT — the decision is already
 // made — and a normal reboot reads OL, which a gate would treat as "mains are
 // back" and abandon, leaving guests running while the host stops underneath them.
-func runHalt(args []string) int {
-	fs := flag.NewFlagSet("halt", flag.ExitOnError)
+func runSleep(args []string) int {
+	fs := flag.NewFlagSet("sleep", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
 	trigger := fs.String("trigger", journal.TriggerUPS, "ups | systemd | manual — recorded, and kept apart in calibration")
@@ -235,7 +198,7 @@ func runHalt(args []string) int {
 	if w != nil {
 		_ = w.Close(res.Completed, res.Aborted)
 	}
-	fmt.Printf("halt: ran %d step(s), complete=%v\n", res.Ran, res.Completed)
+	fmt.Printf("sleep: ran %d step(s), complete=%v\n", res.Ran, res.Completed)
 	return 0
 }
 
@@ -268,4 +231,86 @@ func runReport(args []string) int {
 		}
 	}
 	return 0
+}
+
+// runWake revives a machine after stasis.
+//
+// Stopped is never the desired state, so coming back is as much a part of this
+// as going down. On boot, wake undoes what the last sleep did — uncordons the
+// node, starts the guests it stopped, clears noout — and ships the records of
+// what happened, so the event can be reconstructed once there is somewhere to
+// send it.
+func runWake(args []string) int {
+	fs := flag.NewFlagSet("wake", flag.ExitOnError)
+	var f runFlags
+	f.bind(fs)
+	noShip := fs.Bool("no-ship", false, "revive without emitting run journals")
+	_ = fs.Parse(args)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	runs, err := journal.Load(f.runsDir)
+	if err != nil || len(runs) == 0 {
+		fmt.Println("wake: nothing to revive")
+	} else {
+		fmt.Printf("wake: reviving from run %s (%s)\n", runs[0].ID, runs[0].Trigger)
+		revived := undoRun(ctx, f, runs[0])
+		fmt.Printf("wake: undid %d action(s)\n", revived)
+	}
+	if *noShip {
+		return 0
+	}
+	return runReport([]string{"--runs", f.runsDir})
+}
+
+// undoRun reverses the actions a run recorded, newest first, and only those it
+// actually completed — a noout or a cordon an operator set by hand is not ours
+// to clear.
+func undoRun(ctx context.Context, f runFlags, run journal.Run) int {
+	runner := exec.New()
+	var ups *nut.Client
+	if f.upsAddr != "" {
+		ups = nut.New(f.upsAddr, f.upsName)
+		ups.User, ups.Pass = f.upsUser, f.password()
+	}
+
+	undone := 0
+	for i := len(run.Steps) - 1; i >= 0; i-- {
+		s := run.Steps[i]
+		if s.Outcome != journal.OutcomeDone {
+			continue
+		}
+		var undo func() error
+		var what string
+		switch s.Action {
+		case string(plan.ActionUPSDeadline):
+			// Most urgent: left standing, the UPS cuts power to a machine that
+			// has already come back.
+			if ups != nil {
+				undo, what = func() error { return ups.Cancel(ctx) }, "cancel UPS deadline"
+			}
+		case string(plan.ActionK8sCordon):
+			undo, what = func() error { return runner.Uncordon(ctx, s.Target) }, "uncordon "+s.Target
+		case string(plan.ActionGuestStop):
+			undo, what = func() error { return runner.Start(ctx, s.Target) }, "start guest "+s.Target
+		case string(plan.ActionCephNoout):
+			undo, what = func() error { return runner.UnsetNoout(ctx) }, "unset noout"
+		}
+		if undo == nil {
+			continue
+		}
+		if f.dryRun {
+			fmt.Printf("  would %s\n", what)
+			undone++
+			continue
+		}
+		if err := undo(); err != nil {
+			fmt.Fprintf(os.Stderr, "  %s: %v\n", what, err)
+			continue
+		}
+		fmt.Printf("  %s\n", what)
+		undone++
+	}
+	return undone
 }
