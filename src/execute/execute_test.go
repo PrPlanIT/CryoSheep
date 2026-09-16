@@ -34,10 +34,15 @@ func (f *fakeUPS) Status(context.Context) (string, error) {
 
 type fakeHyp struct {
 	stopped []string
+	started []string
 	err     error
 }
 
 func (f *fakeHyp) Guests(context.Context) ([]core.Guest, error) { return nil, nil }
+func (f *fakeHyp) Start(_ context.Context, id string) error {
+	f.started = append(f.started, id)
+	return nil
+}
 func (f *fakeHyp) Shutdown(_ context.Context, id string, _ time.Duration) error {
 	f.stopped = append(f.stopped, id)
 	return f.err
@@ -52,6 +57,11 @@ func (f *fakeCeph) SetNoout(context.Context) error   { f.set++; return f.err }
 func (f *fakeCeph) UnsetNoout(context.Context) error { f.unset++; return nil }
 
 type fakeHost struct{ halted int }
+
+type fakeDeadline struct{ armed, cancelled int }
+
+func (f *fakeDeadline) Arm(context.Context, time.Duration) error { f.armed++; return nil }
+func (f *fakeDeadline) Cancel(context.Context) error             { f.cancelled++; return nil }
 
 func (f *fakeHost) Poweroff(context.Context) error { f.halted++; return nil }
 
@@ -238,9 +248,12 @@ func TestGateStatusIsRecordedOnEachGatedStep(t *testing.T) {
 	if rec.steps[0].gate != "OB" {
 		t.Fatalf("gate = %q, want OB recorded against the step it guarded", rec.steps[0].gate)
 	}
-	// Steps past the point of no return are not gated, so they carry no status.
-	if rec.steps[len(rec.steps)-1].gate != "" {
-		t.Fatalf("ungated step carries a gate value: %+v", rec.steps[len(rec.steps)-1])
+	// Every step is now gated, including the halt — it is the committing one, so
+	// its gate is the last chance to abandon before the host goes down.
+	for i, s := range rec.steps {
+		if s.gate == "" {
+			t.Fatalf("step %d (%s) was not gated: %+v", i+1, s.action, s)
+		}
 	}
 }
 
@@ -267,5 +280,79 @@ func TestNoGateNeverConsultsTheUPS(t *testing.T) {
 	_ = e.Run(context.Background(), testPlan())
 	if ups.calls != 0 {
 		t.Fatalf("UPS consulted %d times with NoGate set, want 0", ups.calls)
+	}
+}
+
+// The scenario this exists for: power fails, the sequence starts, mains return
+// while the third of six guests is stopping. Completing the shutdown would turn
+// a recovered outage into a real one.
+func TestMainsReturningMidGuestsAbandonsAndRestarts(t *testing.T) {
+	hyp, host, dl, rec := &fakeHyp{}, &fakeHost{}, &fakeDeadline{}, &recorder{}
+	// on battery for the deadline, noout and the first two guests; mains back at
+	// the third.
+	ups := &fakeUPS{statuses: []string{
+		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnBattery,
+		core.StatusOnBattery, core.StatusOnline,
+	}}
+	p := plan.Build("avocado",
+		[]core.Role{core.RoleProxmox, core.RoleCephOSD},
+		[]core.Guest{
+			{ID: "1", Status: "running"}, {ID: "2", Status: "running"}, {ID: "3", Status: "running"},
+		},
+		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
+	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups, Deadline: dl, Record: rec}
+
+	res := e.Run(context.Background(), p)
+	if !res.Aborted {
+		t.Fatal("mains returning mid-sequence did not abandon the shutdown")
+	}
+	if host.halted != 0 {
+		t.Fatal("the host halted anyway — this is the unnecessary outage")
+	}
+	if len(hyp.started) != len(hyp.stopped) {
+		t.Fatalf("stopped %v but restarted %v — guests were left down", hyp.stopped, hyp.started)
+	}
+	if dl.cancelled != 1 {
+		t.Fatalf("UPS deadline cancelled %d times; a standing timer cuts power to a recovered estate", dl.cancelled)
+	}
+}
+
+// The deadline must be cancelled before guests are restarted: it is a timer the
+// hardware already holds, and it does not wait for the tidying up.
+func TestDeadlineIsCancelledBeforeGuestsAreRestarted(t *testing.T) {
+	rec := &recorder{}
+	ups := &fakeUPS{statuses: []string{
+		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
+	}}
+	p := plan.Build("h", []core.Role{core.RoleProxmox},
+		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
+		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
+	e := &Executor{Hyp: &fakeHyp{}, Ceph: &fakeCeph{}, Host: &fakeHost{},
+		UPS: ups, Deadline: &fakeDeadline{}, Record: rec}
+	_ = e.Run(context.Background(), p)
+
+	var undoOrder []string
+	for _, s := range rec.steps {
+		if len(s.action) > 5 && s.action[len(s.action)-5:] == ".undo" {
+			undoOrder = append(undoOrder, s.action)
+		}
+	}
+	if len(undoOrder) == 0 || undoOrder[0] != string(plan.ActionUPSDeadline)+".undo" {
+		t.Fatalf("undo order = %v, want the deadline cancelled first", undoOrder)
+	}
+}
+
+// Only the halt truly commits the host now.
+func TestOnlyTheHaltIsIrreversible(t *testing.T) {
+	p := plan.Build("h", []core.Role{core.RoleProxmox, core.RoleCephOSD},
+		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
+		core.StatusOnBattery, plan.Options{UPSDeadline: time.Minute})
+	pnr := p.PointOfNoReturn()
+	if pnr != len(p.Steps)-1 {
+		t.Fatalf("point of no return at %d of %d; everything before the halt should be reversible",
+			pnr, len(p.Steps))
+	}
+	if p.Steps[pnr].Action != plan.ActionHostHalt {
+		t.Fatalf("the committing step is %q, want the host halt", p.Steps[pnr].Action)
 	}
 }

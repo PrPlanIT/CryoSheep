@@ -163,6 +163,11 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 			Target:  g.ID,
 			Detail:  g.Name,
 			Timeout: budget,
+			// Undoable: the guest can be started again. Gating every guest is
+			// what stops a recovered outage from becoming a real one — power
+			// back while the third of six is stopping must abandon the
+			// sequence, not complete it.
+			Reversible: true,
 		})
 	}
 

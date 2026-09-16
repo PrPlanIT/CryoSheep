@@ -167,6 +167,14 @@ func (r *Runner) Shutdown(ctx context.Context, id string, timeout time.Duration)
 	return nil
 }
 
+// Start boots a guest again, undoing a shutdown this run performed.
+func (r *Runner) Start(ctx context.Context, id string) error {
+	if _, err := r.Run(ctx, "qm", "start", id); err != nil {
+		return fmt.Errorf("qm start %s: %w", id, err)
+	}
+	return nil
+}
+
 // SetNoout stops the cluster reacting to a departure that is deliberate.
 //
 // Shelled to the ceph CLI rather than go-ceph: those bindings are cgo and need

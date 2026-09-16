@@ -74,6 +74,11 @@ type Units interface {
 type Hypervisor interface {
 	Guests(ctx context.Context) ([]Guest, error)
 	Shutdown(ctx context.Context, id string, timeout time.Duration) error
+
+	// Start puts a guest back. Stopping one is undoable — the guest boots again
+	// — which is what lets mains returning mid-sequence abandon the shutdown
+	// instead of completing an outage nobody needed.
+	Start(ctx context.Context, id string) error
 }
 
 // UPS reads UPS state. CryoSheep does not monitor it — upsmon owns the event

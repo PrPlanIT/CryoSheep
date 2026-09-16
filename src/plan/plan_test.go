@@ -67,17 +67,24 @@ func TestStoppedGuestsProduceNoStep(t *testing.T) {
 
 // The gate boundary is the contract the executor relies on: everything before
 // it may be abandoned, everything from it on commits the host.
-func TestPointOfNoReturnIsFirstIrreversibleStep(t *testing.T) {
+//
+// Only the halt commits. Stopping a guest is undoable — it can be started again
+// — and treating it as final is what would let a recovered outage complete into
+// a real one.
+func TestOnlyTheHaltCommitsTheHost(t *testing.T) {
 	guests := []core.Guest{{ID: "102", Name: "a", Status: "running"}}
 	p := Build("eggplant", []core.Role{core.RoleCephOSD}, guests, core.StatusOnBattery, Options{})
-	if got := p.PointOfNoReturn(); got != 1 {
-		t.Fatalf("PointOfNoReturn = %d, want 1 (noout reversible, guest stop not)", got)
+	pnr := p.PointOfNoReturn()
+	if pnr != len(p.Steps)-1 {
+		t.Fatalf("PointOfNoReturn = %d of %d steps, want only the halt to commit", pnr, len(p.Steps))
 	}
-	if !p.Steps[0].Reversible {
-		t.Fatal("noout must be reversible")
+	if p.Steps[pnr].Action != ActionHostHalt {
+		t.Fatalf("committing step is %q, want %q", p.Steps[pnr].Action, ActionHostHalt)
 	}
-	if p.Steps[1].Reversible {
-		t.Fatal("stopping a guest must not be reversible")
+	for i, s := range p.Steps[:pnr] {
+		if !s.Reversible {
+			t.Fatalf("step %d (%s) is not reversible; it would be ungated", i+1, s.Action)
+		}
 	}
 }
 

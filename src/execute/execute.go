@@ -197,9 +197,50 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 // run actually performed — a noout an operator set for maintenance is not ours
 // to clear.
 func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, gate string) int {
+	// The armed UPS deadline is cancelled before anything else. It is a timer
+	// the hardware already holds: leaving it standing while guests are restarted
+	// would cut power to a recovered estate a few minutes later, which is the
+	// outage this abort exists to prevent.
 	n := 0
+	for _, s := range done {
+		if s.Action == plan.ActionUPSDeadline && e.Deadline != nil {
+			idx := rec.StepStart(string(s.Action)+".undo", "", gate)
+			var err error
+			if !e.DryRun {
+				err = e.Deadline.Cancel(ctx)
+			}
+			if err != nil {
+				rec.StepEnd(idx, journal.OutcomeFailed, err)
+			} else {
+				rec.StepEnd(idx, journal.OutcomeDone, nil)
+				n++
+			}
+			break
+		}
+	}
+
 	for i := len(done) - 1; i >= 0; i-- {
 		s := done[i]
+		if s.Action == plan.ActionUPSDeadline {
+			continue // already cancelled above
+		}
+		if s.Action == plan.ActionGuestStop {
+			if e.Hyp == nil {
+				continue
+			}
+			idx := rec.StepStart(string(s.Action)+".undo", s.Target, gate)
+			var err error
+			if !e.DryRun {
+				err = e.Hyp.Start(ctx, s.Target)
+			}
+			if err != nil {
+				rec.StepEnd(idx, journal.OutcomeFailed, err)
+				continue
+			}
+			rec.StepEnd(idx, journal.OutcomeDone, nil)
+			n++
+			continue
+		}
 		undo := e.undoFor(s.Action)
 		if undo == nil {
 			continue
@@ -222,6 +263,8 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 // undoFor returns the inverse of an action, or nil where there is none.
 func (e *Executor) undoFor(a plan.Action) func(context.Context) error {
 	switch a {
+	case plan.ActionGuestStop:
+		return nil // handled per-target in reverse, which knows which guest
 	case plan.ActionUPSDeadline:
 		if e.Deadline == nil {
 			return nil
