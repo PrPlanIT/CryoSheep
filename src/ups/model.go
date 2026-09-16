@@ -13,18 +13,19 @@ package ups
 import (
 	"strings"
 	"time"
+
+	"github.com/PrPlanIT/CryoSheep/src/core"
 )
 
-// Unknown marks a field the driver did not report. The snmp-ups subdriver in use
-// reports charge and runtime but not the low thresholds, so callers must cope
-// with absence rather than assume zero.
-const Unknown = -1
+// Unknown marks a field the driver did not report.
+const Unknown = core.Unknown
 
 type Sample struct {
 	At      time.Time
 	Status  string        // raw ups.status, e.g. "OL" or "OB LB"
 	Charge  float64       // percent, or Unknown
 	Runtime time.Duration // remaining, or Unknown
+	InputV  float64       // input voltage, or Unknown
 }
 
 func (s Sample) Has(flag string) bool {
@@ -131,4 +132,43 @@ func (m Model) InterpretSilence(now time.Time, grace time.Duration) Reading {
 		return ReadingExpected
 	}
 	return ReadingDegrading
+}
+
+// MainsBack reports whether utility power has positively returned.
+//
+// The status flag alone is a weak test. A transfer can flap it, and a UPS need
+// not clear OB promptly — so a sequence waiting on the flag either abandons on a
+// flicker or keeps stopping things after power is already back. What actually
+// proves recovery is the battery no longer draining while input power is
+// present.
+//
+// Two ways to be sure, either sufficient:
+//
+//   - the UPS says OL and no longer says OB; or
+//   - input voltage is present and the battery has stopped draining — charge
+//     rising, or runtime no longer falling.
+//
+// Absence of information is never recovery. A UPS that cannot be read has not
+// told us anything, and must not be taken to have told us the good news.
+func (m Model) MainsBack() bool {
+	if !m.Seen() {
+		return false
+	}
+	last := m.last
+	if last.Online() && !last.OnBattery() {
+		return true
+	}
+	if last.InputV == Unknown || last.InputV <= 0 {
+		return false // no utility power at the input: definitely not back
+	}
+	if m.seen < 2 {
+		return false // one sample shows no trend
+	}
+	if last.Charge != Unknown && m.prev.Charge != Unknown && last.Charge > m.prev.Charge {
+		return true // charging again
+	}
+	if last.Runtime != Unknown && m.prev.Runtime != Unknown && last.Runtime >= m.prev.Runtime {
+		return true // no longer draining
+	}
+	return false
 }

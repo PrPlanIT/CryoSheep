@@ -17,19 +17,19 @@ type fakeUPS struct {
 	calls    int
 }
 
-func (f *fakeUPS) Status(context.Context) (string, error) {
+func (f *fakeUPS) Read(context.Context) (core.Reading, error) {
 	f.calls++
 	if f.err != nil {
-		return "", f.err
+		return core.Reading{}, f.err
 	}
-	if len(f.statuses) == 0 {
-		return core.StatusOnBattery, nil
+	s := core.StatusOnBattery
+	if len(f.statuses) > 0 {
+		s = f.statuses[0]
+		if len(f.statuses) > 1 {
+			f.statuses = f.statuses[1:]
+		}
 	}
-	s := f.statuses[0]
-	if len(f.statuses) > 1 {
-		f.statuses = f.statuses[1:]
-	}
-	return s, nil
+	return core.Reading{Status: s, Charge: core.Unknown, Runtime: core.Unknown, InputV: core.Unknown}, nil
 }
 
 type fakeHyp struct {

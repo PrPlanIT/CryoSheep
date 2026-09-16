@@ -85,3 +85,59 @@ func TestStatusFlagsAreASet(t *testing.T) {
 		t.Fatalf("flags wrong for %q: OB=%v LB=%v OL=%v", s.Status, s.OnBattery(), s.LowBattery(), s.Online())
 	}
 }
+
+// The status flag alone is a weak test: a transfer can flap it. What proves
+// recovery is the battery no longer draining with input power present.
+func TestMainsBackOnFlagAlone(t *testing.T) {
+	var m Model
+	m.Observe(Sample{At: t0, Status: "OL", Charge: 80, Runtime: 300 * time.Second, InputV: 120})
+	if !m.MainsBack() {
+		t.Fatal("OL with no OB should read as mains back")
+	}
+}
+
+func TestStillOnBatteryIsNotBack(t *testing.T) {
+	var m Model
+	m.Observe(Sample{At: t0, Status: "OB", Charge: 80, Runtime: 300 * time.Second, InputV: 0})
+	if m.MainsBack() {
+		t.Fatal("on battery with no input voltage read as mains back")
+	}
+}
+
+// The case the flag misses: input power is present and charge is climbing, but
+// the UPS has not cleared OB yet.
+func TestChargeRisingWithInputCountsAsBack(t *testing.T) {
+	var m Model
+	m.Observe(Sample{At: t0, Status: "OB", Charge: 61, Runtime: 240 * time.Second, InputV: 118})
+	m.Observe(Sample{At: t0.Add(10 * time.Second), Status: "OB", Charge: 62, Runtime: 250 * time.Second, InputV: 119})
+	if !m.MainsBack() {
+		t.Fatal("charge rising with input voltage present should read as mains back")
+	}
+}
+
+// Draining is draining, whatever the input reads.
+func TestStillDrainingIsNotBack(t *testing.T) {
+	var m Model
+	m.Observe(Sample{At: t0, Status: "OB", Charge: 62, Runtime: 250 * time.Second, InputV: 118})
+	m.Observe(Sample{At: t0.Add(10 * time.Second), Status: "OB", Charge: 61, Runtime: 240 * time.Second, InputV: 118})
+	if m.MainsBack() {
+		t.Fatal("charge still falling read as mains back")
+	}
+}
+
+// One sample shows no trend, so it cannot be evidence of recovery.
+func TestSingleSampleIsNotATrend(t *testing.T) {
+	var m Model
+	m.Observe(Sample{At: t0, Status: "OB", Charge: 62, Runtime: 250 * time.Second, InputV: 118})
+	if m.MainsBack() {
+		t.Fatal("a single on-battery sample read as mains back")
+	}
+}
+
+// Absence of information is never recovery.
+func TestNoReadingIsNotBack(t *testing.T) {
+	var m Model
+	if m.MainsBack() {
+		t.Fatal("never having read the UPS read as mains back")
+	}
+}

@@ -80,8 +80,8 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	if f.upsAddr != "" {
 		c := nut.New(f.upsAddr, f.upsName)
 		ups = c
-		if s, err := c.Status(ctx); err == nil {
-			status = s
+		if r, err := c.Read(ctx); err == nil {
+			status = r.Status
 		} else {
 			fmt.Fprintf(os.Stderr, "warning: could not read UPS: %v\n", err)
 		}

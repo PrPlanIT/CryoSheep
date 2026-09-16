@@ -81,11 +81,29 @@ type Hypervisor interface {
 	Start(ctx context.Context, id string) error
 }
 
+// Reading is one observation of the UPS.
+//
+// More than the status flag, because the flag alone is a poor test for "mains
+// are back": a transfer can flap it, and a UPS need not clear OB promptly. What
+// actually proves recovery is the battery no longer draining while input power
+// is present.
+type Reading struct {
+	Status  string
+	Charge  float64       // percent, or Unknown
+	Runtime time.Duration // remaining, or Unknown
+	InputV  float64       // input voltage, or Unknown
+}
+
+// Unknown marks a value the driver did not report. The snmp-ups subdriver in use
+// reports charge, runtime and input voltage but not the low thresholds, so
+// callers must cope with absence rather than assume zero.
+const Unknown = -1
+
 // UPS reads UPS state. CryoSheep does not monitor it — upsmon owns the event
-// stream — but it re-reads status as a guard before each reversible step, so
-// that power returning mid-sequence aborts rather than being noticed later.
+// stream — but it re-reads before each reversible step, so that power returning
+// mid-sequence abandons the sequence rather than being noticed too late.
 type UPS interface {
-	Status(ctx context.Context) (string, error)
+	Read(ctx context.Context) (Reading, error)
 }
 
 // Ceph stops and restarts the cluster's reaction to a host leaving. Only the

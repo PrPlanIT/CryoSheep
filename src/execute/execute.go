@@ -27,6 +27,7 @@ import (
 	"github.com/PrPlanIT/CryoSheep/src/core"
 	"github.com/PrPlanIT/CryoSheep/src/journal"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
+	"github.com/PrPlanIT/CryoSheep/src/ups"
 )
 
 // Recorder is the subset of the journal the executor needs, so a walk can be
@@ -59,6 +60,9 @@ type Executor struct {
 	// leave guests running while the host stops underneath them.
 	NoGate bool
 
+	// Clock is swappable so trend logic can be tested without waiting.
+	Clock func() time.Time
+
 	// GateTimeout bounds a UPS read. A gate that cannot answer promptly is as
 	// useless as one that answers wrongly, and this runs against a battery.
 	GateTimeout time.Duration
@@ -89,11 +93,12 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 
 	var res Result
 	var reversible []plan.Step // completed and undoable, for LIFO reversal
+	var model ups.Model        // readings accumulate, so a trend is available
 
 	for i, step := range p.Steps {
 		gate := ""
 		if !e.NoGate && i <= pnr {
-			status, back := e.mainsBack(ctx)
+			status, back := e.mainsBack(ctx, &model)
 			gate = status
 			if back {
 				res.Aborted = true
@@ -119,10 +124,14 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 
 // mainsBack reports whether power has positively returned.
 //
+// Each reading is fed to the model, so the decision can use a trend rather than
+// a single flag: a transfer can flap OL/OB, and what actually proves recovery is
+// the battery no longer draining with input power present.
+//
 // Unreadable means "no information", which is not the same as "mains are back"
 // and must not be treated as it. The armed hardware deadline covers the blind
 // case; this reacts only to something it can actually see.
-func (e *Executor) mainsBack(ctx context.Context) (string, bool) {
+func (e *Executor) mainsBack(ctx context.Context, model *ups.Model) (string, bool) {
 	if e.UPS == nil {
 		return "", false
 	}
@@ -133,26 +142,21 @@ func (e *Executor) mainsBack(ctx context.Context) (string, bool) {
 	gctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	status, err := e.UPS.Status(gctx)
+	r, err := e.UPS.Read(gctx)
 	if err != nil {
 		return "unreadable", false
 	}
-	return status, hasFlag(status, core.StatusOnline) && !hasFlag(status, core.StatusOnBattery)
+	model.Observe(ups.Sample{
+		At: e.now(), Status: r.Status, Charge: r.Charge, Runtime: r.Runtime, InputV: r.InputV,
+	})
+	return r.Status, model.MainsBack()
 }
 
-// hasFlag tests membership: ups.status is a space-separated set, so "OB LB"
-// carries OB and equality against the whole string would miss it.
-func hasFlag(status, flag string) bool {
-	start := 0
-	for i := 0; i <= len(status); i++ {
-		if i == len(status) || status[i] == ' ' {
-			if status[start:i] == flag {
-				return true
-			}
-			start = i + 1
-		}
+func (e *Executor) now() time.Time {
+	if e.Clock != nil {
+		return e.Clock()
 	}
-	return false
+	return time.Now()
 }
 
 func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {

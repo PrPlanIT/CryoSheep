@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+
+	"github.com/PrPlanIT/CryoSheep/src/core"
 	"strings"
 	"time"
 )
@@ -42,6 +44,37 @@ func New(addr, ups string) *Client {
 // Status returns the contents of ups.status, e.g. "OL" or "OB LB".
 func (c *Client) Status(ctx context.Context) (string, error) {
 	return c.get(ctx, "ups.status")
+}
+
+// Read takes one observation: status plus the values that show whether the
+// battery is still draining.
+//
+// Missing variables are reported as Unknown rather than as an error. Drivers
+// differ over what they expose — this one reports no low thresholds at all — and
+// a gate that failed whenever a UPS was less forthcoming than expected would be
+// useless on exactly the hardware it has to work with.
+func (c *Client) Read(ctx context.Context) (core.Reading, error) {
+	status, err := c.get(ctx, "ups.status")
+	if err != nil {
+		return core.Reading{}, err
+	}
+	r := core.Reading{Status: status, Charge: core.Unknown, Runtime: core.Unknown, InputV: core.Unknown}
+	if v, err := c.get(ctx, "battery.charge"); err == nil {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			r.Charge = f
+		}
+	}
+	if v, err := c.get(ctx, "battery.runtime"); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			r.Runtime = time.Duration(n) * time.Second
+		}
+	}
+	if v, err := c.get(ctx, "input.voltage"); err == nil {
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			r.InputV = f
+		}
+	}
+	return r, nil
 }
 
 // get fetches one variable.
