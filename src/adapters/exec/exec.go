@@ -62,13 +62,33 @@ func (r *Runner) Guests(ctx context.Context) ([]core.Guest, error) {
 			continue // unreadable config means unordered, not fatal
 		}
 		guests[i].Order = ParseStartupOrder(string(cfg))
+		guests[i].Down = ParseStartupDown(string(cfg))
 	}
 	return guests, nil
+}
+
+// ParseStartupDown reads `down=N` from a guest's startup line — the seconds
+// Proxmox allows that guest to stop before forcing it. Zero when unset.
+func ParseStartupDown(cfg string) time.Duration {
+	if n := startupField(cfg, "down="); n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 0
 }
 
 // ParseStartupOrder reads `startup: order=N,up=X,down=Y` from `qm config`.
 // Returns core.OrderUnset when the guest has no declared order.
 func ParseStartupOrder(cfg string) int {
+	if n := startupField(cfg, "order="); n >= 0 {
+		return n
+	}
+	return core.OrderUnset
+}
+
+// startupField reads one key from the `startup:` line. Returns -1 when the line
+// or the key is absent. Only `startup:` is considered — `boot: order=scsi0` is a
+// different field entirely, and reading it would invent a priority nobody set.
+func startupField(cfg, key string) int {
 	sc := bufio.NewScanner(strings.NewReader(cfg))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -77,17 +97,17 @@ func ParseStartupOrder(cfg string) int {
 		}
 		for _, part := range strings.Split(strings.TrimPrefix(line, "startup:"), ",") {
 			part = strings.TrimSpace(part)
-			if !strings.HasPrefix(part, "order=") {
+			if !strings.HasPrefix(part, key) {
 				continue
 			}
-			n, err := strconv.Atoi(strings.TrimPrefix(part, "order="))
+			n, err := strconv.Atoi(strings.TrimPrefix(part, key))
 			if err != nil {
-				return core.OrderUnset
+				return -1
 			}
 			return n
 		}
 	}
-	return core.OrderUnset
+	return -1
 }
 
 // ParseQMList reads the fixed-column output of `qm list`. Exported so the parser

@@ -38,6 +38,13 @@ type Guest struct {
 	Name   string
 	Status string // "running", "stopped", ...
 
+	// Down is Proxmox's own per-guest shutdown budget, from `startup: down=N`.
+	// Zero means unset, and the caller's default applies. Read for the same
+	// reason as Order: a firewall that needs three minutes and a scratch VM that
+	// needs twenty seconds should not share one flat timeout, and Proxmox is
+	// already where that is written down.
+	Down time.Duration
+
 	// Order is Proxmox's own startup order, from `startup: order=N`.
 	// CryoSheep reads it rather than keeping a second list: Proxmox already
 	// honours this field when it starts and stops guests itself, and two

@@ -21,7 +21,11 @@ publish:
     format: auto
     checksums: true
     include: ["README.md", "LICENSE"]
-    when: { git_tags: [stable], events: [tag] }
+    when:
+      - { git_tags: [stable], events: [tag] }
+      # Without this a prerelease tag produced no archive at all, so there was
+      # nothing for a release to attach to even once one existed.
+      - { git_tags: [prerelease], events: [tag] }
 
   project-metadata:
     kind: metadata
@@ -38,6 +42,19 @@ publish:
     archives: binaries
     aliases: ["v{version}", "latest"]
     when: { git_tags: [stable], events: [tag] }
+
+  prerelease-release:
+    # An -rc tag is a release candidate: it should be reachable from the repo like
+    # any other, marked prerelease so it does not displace the latest stable one,
+    # and without the "latest" alias for the same reason. Pages are deliberately
+    # absent — a candidate must not overwrite the published documentation site.
+    kind: release
+    security_summary: true
+    registry_links: true
+    repos: [primary]
+    archives: binaries
+    type: prerelease
+    when: { git_tags: [prerelease], events: [tag] }
 
   dev-release:
     kind: release

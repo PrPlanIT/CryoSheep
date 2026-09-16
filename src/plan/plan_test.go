@@ -163,3 +163,30 @@ func TestNoOrdersPreservesListOrder(t *testing.T) {
 		}
 	}
 }
+
+// Proxmox already records how long each guest needs. A flat timeout makes the
+// whole sequence as slow as its most patient member, which is how a plan ends up
+// longer than the battery.
+func TestGuestBudgetComesFromItsOwnDownValue(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "100", Name: "pfSense", Status: "running", Order: 1, Down: 180 * time.Second},
+		{ID: "105", Name: "scratch", Status: "running", Order: core.OrderUnset, Down: 20 * time.Second},
+		{ID: "106", Name: "nodown", Status: "running", Order: core.OrderUnset},
+	}
+	p := Build("h", nil, guests, core.StatusOnBattery, Options{GuestTimeout: 90 * time.Second})
+	got := map[string]time.Duration{}
+	for _, s := range p.Steps {
+		if s.Action == ActionGuestStop {
+			got[s.Detail] = s.Timeout
+		}
+	}
+	if got["pfSense"] != 180*time.Second {
+		t.Fatalf("pfSense budget = %v, want its own 180s", got["pfSense"])
+	}
+	if got["scratch"] != 20*time.Second {
+		t.Fatalf("scratch budget = %v, want its own 20s", got["scratch"])
+	}
+	if got["nodown"] != 90*time.Second {
+		t.Fatalf("nodown budget = %v, want the default 90s", got["nodown"])
+	}
+}

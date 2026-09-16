@@ -151,11 +151,18 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 	}
 
 	for _, g := range shutdownOrder(guests) {
+		// A guest that declares its own budget gets it. Proxmox already knows a
+		// firewall needs longer than a scratch VM; a flat timeout would make the
+		// whole sequence as slow as its most patient member.
+		budget := opts.GuestTimeout
+		if g.Down > 0 {
+			budget = g.Down
+		}
 		p.Steps = append(p.Steps, Step{
 			Action:  ActionGuestStop,
 			Target:  g.ID,
 			Detail:  g.Name,
-			Timeout: opts.GuestTimeout,
+			Timeout: budget,
 		})
 	}
 

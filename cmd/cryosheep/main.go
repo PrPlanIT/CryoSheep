@@ -81,11 +81,11 @@ func runPlan(args []string) int {
 			runtime = d
 		}
 	}
-	render(p, runtime)
+	render(p, runtime, f.guestTimeout)
 	return 0
 }
 
-func render(p plan.Plan, runtime time.Duration) {
+func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 	fmt.Printf("host:  %s\n", p.Host)
 	fmt.Printf("roles: %s\n", join(p.Roles))
 	fmt.Printf("ups:   %s\n", p.UPSStatus)
@@ -100,7 +100,11 @@ func render(p plan.Plan, runtime time.Duration) {
 					ordered++
 				}
 			}
-			fmt.Printf("  %-6s %-24s %-9s %s\n", g.ID, g.Name, g.Status, order)
+			down := ""
+			if g.Down > 0 {
+				down = fmt.Sprintf("down=%s", g.Down)
+			}
+			fmt.Printf("  %-6s %-24s %-9s %-9s %s\n", g.ID, g.Name, g.Status, order, down)
 		}
 	}
 	fmt.Println("plan:")
@@ -134,6 +138,19 @@ func render(p plan.Plan, runtime time.Duration) {
 		if g.Running() {
 			running++
 		}
+	}
+	// A guest with no down= falls back to the flat timeout, which is what makes a
+	// sequence longer than it needs to be.
+	var nodown int
+	for _, g := range p.Guests {
+		if g.Running() && g.Down == 0 {
+			nodown++
+		}
+	}
+	if nodown > 0 {
+		fmt.Printf("\n%d running guest(s) declare no `down=`, so each is budgeted %s.\n"+
+			"  set it per guest to shorten the sequence: qm set <id> --startup order=N,down=SECONDS\n",
+			nodown, defaultBudget)
 	}
 	if running > 0 && ordered == 0 {
 		fmt.Printf("\nno guest declares `startup: order=` — they will stop in VMID order.\n" +

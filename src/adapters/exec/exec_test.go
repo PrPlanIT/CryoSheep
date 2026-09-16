@@ -149,3 +149,33 @@ func TestQMListLeavesOrderUnset(t *testing.T) {
 		}
 	}
 }
+
+func TestParseStartupDown(t *testing.T) {
+	const cfg = "name: pfSense\nstartup: order=1,up=30,down=180\n"
+	if got := ParseStartupDown(cfg); got != 180*time.Second {
+		t.Fatalf("down = %v, want 180s", got)
+	}
+	if got := ParseStartupOrder(cfg); got != 1 {
+		t.Fatalf("order = %d, want 1", got)
+	}
+}
+
+func TestStartupDownAbsentIsZero(t *testing.T) {
+	if got := ParseStartupDown("startup: order=1\nname: x\n"); got != 0 {
+		t.Fatalf("down = %v, want 0 so the default applies", got)
+	}
+	if got := ParseStartupDown("name: x\n"); got != 0 {
+		t.Fatalf("down = %v, want 0", got)
+	}
+}
+
+// `boot: order=scsi0` must not be mistaken for a startup field in either reader.
+func TestBootLineIgnoredByBothReaders(t *testing.T) {
+	const cfg = "boot: order=scsi0;net0\nname: x\n"
+	if got := ParseStartupOrder(cfg); got != core.OrderUnset {
+		t.Fatalf("order = %d, want unset", got)
+	}
+	if got := ParseStartupDown(cfg); got != 0 {
+		t.Fatalf("down = %v, want 0", got)
+	}
+}
