@@ -31,8 +31,8 @@ func main() {
 	switch os.Args[1] {
 	case "plan":
 		os.Exit(runPlan(os.Args[2:]))
-	case "settle":
-		os.Exit(runSettle(os.Args[2:]))
+	case "conserve":
+		os.Exit(runConserve(os.Args[2:]))
 	case "sleep":
 		os.Exit(runSleep(os.Args[2:]))
 	case "cancel":
@@ -55,8 +55,9 @@ func usage() {
 	fmt.Fprint(os.Stderr, `cryosheep — put a machine into stasis, and bring it back
 
   plan       show what would happen here, changing nothing
-  settle     begin winding down, reversibly       (upsmon NOTIFYCMD, ONBATT)
+  conserve   shed load and hold, reversibly        (upsmon NOTIFYCMD, ONBATT)
   sleep      put this machine into stasis         (upsmon SHUTDOWNCMD / systemd)
+             --trigger ups abandons if mains return; manual and systemd do not
   cancel     abandon a sleep and undo it          (upsmon NOTIFYCMD, ONLINE)
   wake       revive after stasis and ship records (on boot)
   report     emit undelivered run journals, once

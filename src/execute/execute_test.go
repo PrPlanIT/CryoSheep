@@ -356,3 +356,49 @@ func TestOnlyTheHaltIsIrreversible(t *testing.T) {
 		t.Fatalf("the committing step is %q, want the host halt", p.Steps[pnr].Action)
 	}
 }
+
+// Why we are stopping decides whether power returning matters.
+//
+// An operator or a systemd reboot asked for this; the UPS reporting healthy
+// power is not news. Abandoning there would leave guests running while the host
+// stops underneath them — the corruption this exists to prevent, caused by the
+// safety mechanism.
+func TestOperatorRequestedSleepIgnoresHealthyPower(t *testing.T) {
+	hyp, host := &fakeHyp{}, &fakeHost{}
+	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, NoGate: true,
+		UPS: &fakeUPS{statuses: []string{core.StatusOnline}}}
+
+	res := e.Run(context.Background(), testPlan())
+	if res.Aborted {
+		t.Fatal("a requested shutdown was abandoned because mains were healthy")
+	}
+	if len(hyp.stopped) != 2 || host.halted != 1 {
+		t.Fatalf("guests=%v halted=%d, want the requested shutdown carried out", hyp.stopped, host.halted)
+	}
+}
+
+// A power-loss sleep is conditional: mains returning removes the reason, so it
+// abandons and puts back what it took down.
+func TestPowerLossSleepAbandonsWhenTheReasonIsGone(t *testing.T) {
+	hyp, host, dl := &fakeHyp{}, &fakeHost{}, &fakeDeadline{}
+	ups := &fakeUPS{statuses: []string{
+		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
+	}}
+	p := plan.Build("avocado", []core.Role{core.RoleProxmox, core.RoleCephOSD},
+		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
+		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
+
+	// NoGate unset: this is the power-loss path.
+	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups, Deadline: dl}
+	res := e.Run(context.Background(), p)
+
+	if !res.Aborted || host.halted != 0 {
+		t.Fatalf("result = %+v halted=%d, want abandoned with the host still up", res, host.halted)
+	}
+	if len(hyp.started) != len(hyp.stopped) {
+		t.Fatalf("stopped %v, restarted %v", hyp.stopped, hyp.started)
+	}
+	if dl.cancelled != 1 {
+		t.Fatalf("deadline cancelled %d times, want 1", dl.cancelled)
+	}
+}

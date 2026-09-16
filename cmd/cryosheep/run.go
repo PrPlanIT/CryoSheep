@@ -104,11 +104,11 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	return p, e, runner
 }
 
-// runSettle performs only the reversible prefix — what can be given back if
+// runConserve performs only the reversible prefix — what can be given back if
 // mains return. Invoked from upsmon's NOTIFYCMD on ONBATT, while the budget is
 // still abundant and nothing has been committed.
-func runSettle(args []string) int {
-	fs := flag.NewFlagSet("settle", flag.ExitOnError)
+func runConserve(args []string) int {
+	fs := flag.NewFlagSet("conserve", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
 	_ = fs.Parse(args)
@@ -119,7 +119,7 @@ func runSettle(args []string) int {
 	p, e, _ := f.build(ctx)
 	p.Steps = p.Steps[:p.PointOfNoReturn()] // reversible prefix only
 	if len(p.Steps) == 0 {
-		fmt.Println("nothing to settle on this host")
+		fmt.Println("nothing to conserve on this host")
 		return 0
 	}
 
@@ -135,11 +135,11 @@ func runSettle(args []string) int {
 		_ = w.Close(res.Completed, res.Aborted)
 	}
 	if res.Aborted {
-		fmt.Printf("settle: stopped before acting — UPS reports %q, so there is nothing to settle (reversed %d)\n",
+		fmt.Printf("conserve: stopped before acting — UPS reports %q, so there is nothing to conserve (reversed %d)\n",
 			res.Gate, res.Reversed)
 		return 0
 	}
-	fmt.Printf("settle: ran %d step(s)\n", res.Ran)
+	fmt.Printf("conserve: ran %d step(s)\n", res.Ran)
 	return 0
 }
 
@@ -185,7 +185,15 @@ func runSleep(args []string) int {
 	defer cancel()
 
 	p, e, _ := f.build(ctx)
-	e.NoGate = true
+
+	// Why we are stopping decides whether power returning matters.
+	//
+	// A power-loss sleep is conditional: mains coming back means the reason is
+	// gone, so the sequence abandons and everything it took down goes back.
+	// An operator or a systemd reboot asked for this, and the UPS reporting
+	// healthy power is simply not news — gating there would abandon a shutdown
+	// that was requested, leaving guests running while the host stops under them.
+	e.NoGate = *trigger != journal.TriggerUPS
 
 	w, err := journal.Open(f.runsDir, p.Host, *trigger)
 	if err != nil {
@@ -197,6 +205,11 @@ func runSleep(args []string) int {
 	res := e.Run(ctx, p)
 	if w != nil {
 		_ = w.Close(res.Completed, res.Aborted)
+	}
+	if res.Aborted {
+		fmt.Printf("sleep: abandoned — UPS reports %q, so the reason for stopping is gone; undid %d action(s)\n",
+			res.Gate, res.Reversed)
+		return 0
 	}
 	fmt.Printf("sleep: ran %d step(s), complete=%v\n", res.Ran, res.Completed)
 	return 0
