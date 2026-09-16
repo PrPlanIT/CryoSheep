@@ -141,12 +141,17 @@ type Kube interface {
 	// StatefulPods lists the stateful workloads on this node and the role each
 	// claims, read before anything is stopped.
 	//
-	// This is the record a revival needs. A quorum service elects from what it
-	// finds on disk, and the node that stopped last cleanly is usually the one
-	// to start from — Galera writes safe_to_bootstrap for exactly this, but only
-	// on a clean stop. If a node is forced off, nothing local says who was
-	// authoritative. A journal that says which instance held primary, on which
-	// node, at what time, is what makes the answer knowable afterwards.
+	// This is evidence, not an instruction. Quorum services recover themselves
+	// from a clean stop — Galera writes safe_to_bootstrap, CNPG checkpoints and
+	// compares LSNs, etcd re-forms from disk — and CryoSheep must not become a
+	// second authority deciding who is primary. Two things electing is how split
+	// brain happens, which is the outcome this whole design exists to avoid.
+	//
+	// The record is for when that recovery does not work. A node forced off
+	// writes no safe_to_bootstrap; an operator promotes the wrong instance. Then
+	// somebody has to answer "which one was authoritative before the outage",
+	// and without this the answer is gone. Written for a human at three in the
+	// morning, never read back as a decision.
 	StatefulPods(ctx context.Context, node string) ([]StatefulPod, error)
 
 	// UnmountCSI releases Ceph and CSI mounts before the network goes, returning

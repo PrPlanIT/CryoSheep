@@ -250,6 +250,12 @@ func runReport(args []string) int {
 // node, starts the guests it stopped, clears noout — and ships the records of
 // what happened, so the event can be reconstructed once there is somewhere to
 // send it.
+//
+// It undoes CryoSheep's own actions and nothing else. Databases and quorum
+// services bring themselves back: they are built to, given a clean stop, and a
+// second thing deciding who is primary is how split brain happens. If their
+// recovery goes wrong, the journal says what was true beforehand — for a person
+// to read, not for this to act on.
 func runWake(args []string) int {
 	fs := flag.NewFlagSet("wake", flag.ExitOnError)
 	var f runFlags
