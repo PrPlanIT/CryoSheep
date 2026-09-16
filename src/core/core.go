@@ -95,6 +95,24 @@ type Ceph interface {
 	UnsetNoout(ctx context.Context) error
 }
 
+// Kube is this node's own membership of a cluster. Every call is about the node
+// it runs on: CryoSheep never manages other nodes.
+//
+// A stock Debian/Ubuntu poweroff handles none of this well. Pods are killed
+// rather than evicted, and CSI mounts that cannot be unmounted stall systemd for
+// TimeoutStopSec each — which is why a node that should stop in seconds takes
+// minutes.
+type Kube interface {
+	Cordon(ctx context.Context, node string) error
+	Uncordon(ctx context.Context, node string) error
+	Drain(ctx context.Context, node string, timeout time.Duration) error
+
+	// UnmountCSI releases Ceph and CSI mounts before the network goes, returning
+	// how many it released. Left mounted, each one is a unit systemd waits on
+	// while its backing network is already gone.
+	UnmountCSI(ctx context.Context) (int, error)
+}
+
 // Host is the machine itself. Separate from Hypervisor because a host with no
 // guests still has to stop, and because it is the one call that ends the process
 // making it.

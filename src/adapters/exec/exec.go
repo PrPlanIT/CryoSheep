@@ -167,6 +167,85 @@ func (r *Runner) Shutdown(ctx context.Context, id string, timeout time.Duration)
 	return nil
 }
 
+// Cordon stops the scheduler placing new work on a node that is leaving.
+func (r *Runner) Cordon(ctx context.Context, node string) error {
+	if _, err := r.Run(ctx, "kubectl", "cordon", node); err != nil {
+		return fmt.Errorf("kubectl cordon %s: %w", node, err)
+	}
+	return nil
+}
+
+func (r *Runner) Uncordon(ctx context.Context, node string) error {
+	if _, err := r.Run(ctx, "kubectl", "uncordon", node); err != nil {
+		return fmt.Errorf("kubectl uncordon %s: %w", node, err)
+	}
+	return nil
+}
+
+// Drain evicts this node's pods within a bound.
+//
+// --force and --delete-emptydir-data are deliberate: a node being powered off
+// cannot honour a pod that has nowhere to go, and refusing to proceed would
+// leave it running until the battery decided instead.
+func (r *Runner) Drain(ctx context.Context, node string, timeout time.Duration) error {
+	secs := int(timeout.Seconds())
+	if secs <= 0 {
+		secs = 60
+	}
+	_, err := r.Run(ctx, "kubectl", "drain", node,
+		"--ignore-daemonsets", "--delete-emptydir-data", "--force",
+		"--timeout", fmt.Sprintf("%ds", secs))
+	if err != nil {
+		return fmt.Errorf("kubectl drain %s: %w", node, err)
+	}
+	return nil
+}
+
+// UnmountCSI releases Ceph and CSI mounts before the network goes.
+//
+// This is the stall. systemd waits TimeoutStopSec on every mount unit whose
+// backing store has already become unreachable, which is how a node that should
+// stop in seconds takes minutes. Lazy unmount detaches the tree immediately and
+// lets the kernel clean up, rather than blocking on a server that is gone.
+func (r *Runner) UnmountCSI(ctx context.Context) (int, error) {
+	out, err := r.Run(ctx, "findmnt", "-rn", "-o", "TARGET,FSTYPE")
+	if err != nil {
+		return 0, fmt.Errorf("findmnt: %w", err)
+	}
+	n := 0
+	for _, target := range CSIMounts(string(out)) {
+		if _, err := r.Run(ctx, "umount", "-l", target); err == nil {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// CSIMounts picks the mounts worth releasing from findmnt output: Ceph and the
+// fuse mounts CSI drivers create. Exported so the selection can be tested
+// against real output — unmounting the wrong thing on a live node is worse than
+// unmounting nothing.
+func CSIMounts(out string) []string {
+	var targets []string
+	sc := bufio.NewScanner(strings.NewReader(out))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 2 {
+			continue
+		}
+		target, fstype := f[0], f[1]
+		switch {
+		case fstype == "ceph", fstype == "rbd", fstype == "fuse.ceph-fuse":
+		case strings.HasPrefix(fstype, "fuse.") && strings.Contains(target, "/kubelet/"):
+		case strings.Contains(target, "/kubelet/pods/"), strings.Contains(target, "/kubelet/plugins/"):
+		default:
+			continue
+		}
+		targets = append(targets, target)
+	}
+	return targets
+}
+
 // Start boots a guest again, undoing a shutdown this run performed.
 func (r *Runner) Start(ctx context.Context, id string) error {
 	if _, err := r.Run(ctx, "qm", "start", id); err != nil {

@@ -24,6 +24,7 @@ type runFlags struct {
 	upsAddr      string
 	upsName      string
 	guestTimeout time.Duration
+	drainTimeout time.Duration
 	dryRun       bool
 	deadline     time.Duration
 	upsUser      string
@@ -35,6 +36,7 @@ func (f *runFlags) bind(fs *flag.FlagSet) {
 	fs.StringVar(&f.upsAddr, "ups-addr", "", "NUT server host[:port]")
 	fs.StringVar(&f.upsName, "ups-name", "ups", "UPS name as upsd knows it")
 	fs.DurationVar(&f.guestTimeout, "guest-timeout", 90*time.Second, "per-guest ACPI shutdown budget")
+	fs.DurationVar(&f.drainTimeout, "drain-timeout", 60*time.Second, "bound on evicting this node's pods")
 	fs.BoolVar(&f.dryRun, "dry-run", false, "walk and record the decisions without performing them")
 	fs.DurationVar(&f.deadline, "deadline", 0, "arm the UPS to cut power after this long regardless of the sequence; 0 disables")
 	fs.StringVar(&f.upsUser, "ups-user", "", "NUT user permitted to send instant commands")
@@ -91,9 +93,13 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		}
 	}
 
-	opts := plan.Options{GuestTimeout: f.guestTimeout, UPSDeadline: f.deadline}
+	opts := plan.Options{
+		GuestTimeout: f.guestTimeout,
+		DrainTimeout: f.drainTimeout,
+		UPSDeadline:  f.deadline,
+	}
 	p := plan.Build(host, roles, guests, status, opts)
-	e := &execute.Executor{Hyp: runner, UPS: ups, Ceph: runner, Host: runner,
+	e := &execute.Executor{Hyp: runner, UPS: ups, Ceph: runner, Kube: runner, Host: runner,
 		Deadline: deadline, DryRun: f.dryRun}
 	return p, e, runner
 }

@@ -45,6 +45,7 @@ type Executor struct {
 	Hyp      core.Hypervisor
 	UPS      core.UPS
 	Ceph     core.Ceph
+	Kube     core.Kube
 	Host     core.Host
 	Deadline core.Deadline
 	Record   Recorder
@@ -173,6 +174,29 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 		if err := e.Ceph.SetNoout(ctx); err != nil {
 			return journal.OutcomeFailed, err
 		}
+	case plan.ActionK8sCordon:
+		if e.Kube == nil {
+			return journal.OutcomeSkipped, nil
+		}
+		if err := e.Kube.Cordon(ctx, s.Target); err != nil {
+			return journal.OutcomeFailed, err
+		}
+	case plan.ActionK8sDrain:
+		if e.Kube == nil {
+			return journal.OutcomeSkipped, nil
+		}
+		// A pod that will not evict must not hold the sequence open. The node is
+		// going down either way; the bound decides whether it goes tidily.
+		if err := e.Kube.Drain(ctx, s.Target, s.Timeout); err != nil {
+			return journal.OutcomeForced, err
+		}
+	case plan.ActionK8sUnmount:
+		if e.Kube == nil {
+			return journal.OutcomeSkipped, nil
+		}
+		if _, err := e.Kube.UnmountCSI(ctx); err != nil {
+			return journal.OutcomeFailed, err
+		}
 	case plan.ActionGuestStop:
 		if e.Hyp == nil {
 			return journal.OutcomeSkipped, nil
@@ -223,6 +247,23 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 		s := done[i]
 		if s.Action == plan.ActionUPSDeadline {
 			continue // already cancelled above
+		}
+		if s.Action == plan.ActionK8sCordon {
+			if e.Kube == nil {
+				continue
+			}
+			idx := rec.StepStart(string(s.Action)+".undo", s.Target, gate)
+			var err error
+			if !e.DryRun {
+				err = e.Kube.Uncordon(ctx, s.Target)
+			}
+			if err != nil {
+				rec.StepEnd(idx, journal.OutcomeFailed, err)
+				continue
+			}
+			rec.StepEnd(idx, journal.OutcomeDone, nil)
+			n++
+			continue
 		}
 		if s.Action == plan.ActionGuestStop {
 			if e.Hyp == nil {
@@ -275,6 +316,8 @@ func (e *Executor) undoFor(a plan.Action) func(context.Context) error {
 			return nil
 		}
 		return e.Ceph.UnsetNoout
+	case plan.ActionK8sDrain:
+		return nil // uncordoning is what brings workloads back; draining has no separate undo
 	}
 	return nil
 }

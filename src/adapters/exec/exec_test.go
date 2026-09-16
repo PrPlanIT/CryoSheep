@@ -179,3 +179,67 @@ func TestBootLineIgnoredByBothReaders(t *testing.T) {
 		t.Fatalf("down = %v, want 0", got)
 	}
 }
+
+// Captured from a k8s node with Ceph CSI volumes attached.
+const findmntSample = `/                                                          ext4
+/boot                                                      ext4
+/run/lock                                                  tmpfs
+/var/lib/kubelet/pods/9f2/volumes/kubernetes.io~csi/pvc-1/mount  ext4
+/var/lib/kubelet/plugins/kubernetes.io/csi/cephfs/abc/globalmount ceph
+/mnt/media                                                 cifs
+/var/lib/docker/overlay2/abc/merged                        overlay
+`
+
+// Unmounting the wrong thing on a live node is worse than unmounting nothing, so
+// the selection is narrow: Ceph, and the kubelet trees CSI drivers build under.
+func TestCSIMountsSelectsOnlyCephAndKubelet(t *testing.T) {
+	got := CSIMounts(findmntSample)
+	want := map[string]bool{
+		"/var/lib/kubelet/pods/9f2/volumes/kubernetes.io~csi/pvc-1/mount":   true,
+		"/var/lib/kubelet/plugins/kubernetes.io/csi/cephfs/abc/globalmount": true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("selected %v, want exactly %d kubelet/ceph mounts", got, len(want))
+	}
+	for _, g := range got {
+		if !want[g] {
+			t.Fatalf("selected %q, which is not a Ceph or CSI mount", g)
+		}
+	}
+}
+
+// The root filesystem, /boot and a user's CIFS share must never be selected.
+func TestCSIMountsLeavesSystemMountsAlone(t *testing.T) {
+	for _, g := range CSIMounts(findmntSample) {
+		switch g {
+		case "/", "/boot", "/mnt/media", "/run/lock":
+			t.Fatalf("selected %q — unmounting this would break the node, not tidy it", g)
+		}
+	}
+}
+
+func TestCSIMountsHandlesEmptyOutput(t *testing.T) {
+	if got := CSIMounts(""); len(got) != 0 {
+		t.Fatalf("got %v, want none", got)
+	}
+}
+
+func TestDrainIsBoundedAndForces(t *testing.T) {
+	var got []string
+	r := &Runner{Run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		got = append([]string{name}, args...)
+		return nil, nil
+	}}
+	if err := r.Drain(context.Background(), "dungeon-chest-001", 45*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, a := range got {
+		joined += a + " "
+	}
+	for _, want := range []string{"kubectl drain dungeon-chest-001", "--timeout 45s", "--force", "--ignore-daemonsets"} {
+		if !contains(joined, want) {
+			t.Fatalf("drain called as %q, missing %q", joined, want)
+		}
+	}
+}

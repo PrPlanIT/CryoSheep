@@ -197,3 +197,67 @@ func TestGuestBudgetComesFromItsOwnDownValue(t *testing.T) {
 		t.Fatalf("nodown budget = %v, want the default 90s", got["nodown"])
 	}
 }
+
+// A k8s node gets node-local teardown that stock poweroff does badly: cordon and
+// evict before stopping, and release the mounts that otherwise stall systemd.
+func TestKubeletNodeGetsItsOwnTeardown(t *testing.T) {
+	p := Build("dungeon-chest-001", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{})
+	var got []Action
+	for _, s := range p.Steps {
+		got = append(got, s.Action)
+	}
+	want := []Action{ActionK8sCordon, ActionK8sDrain, ActionK8sUnmount, ActionHostHalt}
+	if len(got) != len(want) {
+		t.Fatalf("steps = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("steps = %v, want %v", got, want)
+		}
+	}
+}
+
+// Cordon and drain are undoable — an abandoned shutdown uncordons and the
+// workloads come back. Releasing mounts is not, and sits after them.
+func TestCordonAndDrainAreReversible(t *testing.T) {
+	p := Build("node", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{})
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionK8sCordon, ActionK8sDrain:
+			if !s.Reversible {
+				t.Fatalf("%s must be reversible", s.Action)
+			}
+		case ActionK8sUnmount:
+			if s.Reversible {
+				t.Fatalf("%s must not be reversible", s.Action)
+			}
+		}
+	}
+}
+
+// A hypervisor is not a k8s node and must not get kubectl steps.
+func TestHypervisorGetsNoKubeSteps(t *testing.T) {
+	p := Build("avocado", []core.Role{core.RoleProxmox, core.RoleCephOSD},
+		[]core.Guest{{ID: "100", Status: "running"}}, core.StatusOnBattery, Options{})
+	for _, s := range p.Steps {
+		switch s.Action {
+		case ActionK8sCordon, ActionK8sDrain, ActionK8sUnmount:
+			t.Fatalf("hypervisor plan contains %s", s.Action)
+		}
+	}
+}
+
+func TestDrainTimeoutDefaultsAndOverrides(t *testing.T) {
+	p := Build("n", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{})
+	for _, s := range p.Steps {
+		if s.Action == ActionK8sDrain && s.Timeout != 60*time.Second {
+			t.Fatalf("drain timeout = %v, want 60s", s.Timeout)
+		}
+	}
+	p = Build("n", []core.Role{core.RoleKubelet}, nil, core.StatusOnBattery, Options{DrainTimeout: 20 * time.Second})
+	for _, s := range p.Steps {
+		if s.Action == ActionK8sDrain && s.Timeout != 20*time.Second {
+			t.Fatalf("drain timeout = %v, want 20s", s.Timeout)
+		}
+	}
+}

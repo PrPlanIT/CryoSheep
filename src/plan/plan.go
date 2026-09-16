@@ -23,8 +23,15 @@ const (
 	// if mains return before the host is committed.
 	ActionUPSDeadline Action = "ups.deadline.arm"
 	ActionCephNoout   Action = "ceph.noout.set"
-	ActionGuestStop   Action = "guest.shutdown"
-	ActionHostHalt    Action = "host.poweroff"
+
+	// Node-local kubernetes teardown. Cordon and drain are reversible — an
+	// abandoned shutdown uncordons and the workloads return. Releasing mounts is
+	// not, but by then the node is going down regardless.
+	ActionK8sCordon  Action = "k8s.cordon"
+	ActionK8sDrain   Action = "k8s.drain"
+	ActionK8sUnmount Action = "k8s.csi.unmount"
+	ActionGuestStop  Action = "guest.shutdown"
+	ActionHostHalt   Action = "host.poweroff"
 )
 
 // Step is one unit of the sequence.
@@ -45,6 +52,12 @@ type Options struct {
 	// GuestTimeout bounds each guest's ACPI shutdown before it is forced.
 	GuestTimeout time.Duration
 
+	// DrainTimeout bounds evicting this node's pods. Bounded because a pod that
+	// will not evict must not hold the whole sequence open — the node is going
+	// down either way, and the difference is whether it goes down tidily or
+	// after systemd has waited out every stuck unit.
+	DrainTimeout time.Duration
+
 	// UPSDeadline is how long the UPS should wait before cutting power
 	// regardless of what the sequence managed to do. Zero omits the step, for a
 	// host with no authority over the UPS.
@@ -54,6 +67,9 @@ type Options struct {
 func (o Options) withDefaults() Options {
 	if o.GuestTimeout <= 0 {
 		o.GuestTimeout = 90 * time.Second
+	}
+	if o.DrainTimeout <= 0 {
+		o.DrainTimeout = 60 * time.Second
 	}
 	return o
 }
@@ -148,6 +164,21 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 			Detail:     "stop rebalance for a planned outage",
 			Reversible: true,
 		})
+	}
+
+	// Node-local kubernetes teardown, before the host stops. Cordon first so
+	// nothing new is scheduled onto a node that is leaving, then evict, then
+	// release the mounts that would otherwise stall systemd once the network has
+	// gone.
+	if has(core.RoleKubelet) {
+		p.Steps = append(p.Steps,
+			Step{Action: ActionK8sCordon, Target: host,
+				Detail: "stop scheduling onto a node that is leaving", Reversible: true},
+			Step{Action: ActionK8sDrain, Target: host, Timeout: opts.DrainTimeout,
+				Detail: "evict this node's pods", Reversible: true},
+			Step{Action: ActionK8sUnmount,
+				Detail: "release Ceph/CSI mounts before the network goes"},
+		)
 	}
 
 	for _, g := range shutdownOrder(guests) {
