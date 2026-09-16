@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -194,14 +195,44 @@ func (r *Runner) StatefulPods(ctx context.Context, node string) ([]core.Stateful
 	return ParseStatefulPods(out)
 }
 
-// roleLabels are where workloads publish which instance is authoritative. CNPG
-// writes cnpg.io/instanceRole; others use their own, so several are read and the
-// first present wins.
-var roleLabels = []string{
-	"cnpg.io/instanceRole",
-	"role",
-	"app.kubernetes.io/component",
-	"statefulset.kubernetes.io/pod-name",
+// roleTokens are the words workloads use when they publish which instance is
+// authoritative.
+//
+// Matched against label keys and values rather than against a list of known
+// operators. A curated vendor list only finds the orchestrators someone thought
+// of, and the point of the record is to be useful for a cluster running
+// something nobody here has heard of. CNPG writes cnpg.io/instanceRole=primary,
+// another operator writes role=master, a third writes its own — all of them say
+// one of these words somewhere.
+var roleTokens = []string{"primary", "master", "leader", "replica", "standby", "secondary", "role"}
+
+// roleOf finds the label that says what this instance is, without knowing who
+// wrote it. Returns "key=value" so the record keeps the operator's own
+// vocabulary — CryoSheep gathers evidence, it does not interpret it, and a
+// normalised guess is exactly the kind of confident-but-wrong that hurts during
+// a recovery.
+func roleOf(labels map[string]string) string {
+	// Deterministic: a pod with several matching labels must record the same one
+	// every time, or two runs of the same cluster disagree.
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		v := labels[k]
+		if v == "" {
+			continue
+		}
+		lk, lv := strings.ToLower(k), strings.ToLower(v)
+		for _, tok := range roleTokens {
+			if strings.Contains(lk, tok) || strings.Contains(lv, tok) {
+				return k + "=" + v
+			}
+		}
+	}
+	return ""
 }
 
 // ParseStatefulPods picks the workloads worth recording out of `kubectl get
@@ -211,6 +242,12 @@ var roleLabels = []string{
 func ParseStatefulPods(data []byte) ([]core.StatefulPod, error) {
 	var list struct {
 		Items []struct {
+			Spec struct {
+				// A priority class is the platform's own statement of what
+				// matters, set by whoever deployed the workload rather than
+				// inferred here.
+				PriorityClassName string `json:"priorityClassName"`
+			} `json:"spec"`
 			Metadata struct {
 				Name            string            `json:"name"`
 				Namespace       string            `json:"namespace"`
@@ -237,18 +274,13 @@ func ParseStatefulPods(data []byte) ([]core.StatefulPod, error) {
 				break
 			}
 		}
-		role := ""
-		for _, k := range roleLabels {
-			if v, ok := m.Labels[k]; ok && v != "" && k != "statefulset.kubernetes.io/pod-name" {
-				role = v
-				break
-			}
-		}
+		role := roleOf(m.Labels)
 		if !stateful && role == "" {
 			continue
 		}
 		out = append(out, core.StatefulPod{
 			Namespace: m.Namespace, Name: m.Name, Owner: owner, Role: role,
+			Priority: it.Spec.PriorityClassName,
 		})
 	}
 	return out, nil

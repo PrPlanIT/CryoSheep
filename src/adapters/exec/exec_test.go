@@ -245,14 +245,15 @@ func TestParseStatefulPodsKeepsRoles(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("recorded %d pods, want 3 stateful ones: %+v", len(got), got)
 	}
+	// The label is kept whole, so the record carries the operator's own wording.
 	var primary string
 	for _, p := range got {
-		if p.Role == "primary" {
+		if p.Role == "cnpg.io/instanceRole=primary" {
 			primary = p.Namespace + "/" + p.Name
 		}
 	}
 	if primary != "db/pg-1" {
-		t.Fatalf("primary recorded as %q, want db/pg-1", primary)
+		t.Fatalf("primary recorded as %q, want db/pg-1; roles seen: %+v", primary, got)
 	}
 }
 
@@ -270,5 +271,48 @@ func TestParseStatefulPodsEmpty(t *testing.T) {
 	got, err := ParseStatefulPods([]byte(`{"items":[]}`))
 	if err != nil || len(got) != 0 {
 		t.Fatalf("got %v, %v", got, err)
+	}
+}
+
+// The record has to be useful for a cluster running something nobody here has
+// heard of, so roles are found by the words operators use — not by a list of
+// the operators someone remembered.
+func TestRoleOfFindsUnknownOperators(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		labels     map[string]string
+	}{
+		{"cnpg", "cnpg.io/instanceRole=primary", map[string]string{"cnpg.io/instanceRole": "primary"}},
+		{"plain role", "role=master", map[string]string{"role": "master"}},
+		{"vendor nobody knows", "acme.example/db-leader=true", map[string]string{"acme.example/db-leader": "true"}},
+		{"value carries it", "state=standby", map[string]string{"state": "standby"}},
+		{"none", "", map[string]string{"app": "web", "tier": "frontend"}},
+	} {
+		if got := roleOf(tc.labels); got != tc.want {
+			t.Fatalf("%s: roleOf = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Two runs of the same cluster must record the same label, or the evidence
+// contradicts itself between hosts.
+func TestRoleOfIsDeterministic(t *testing.T) {
+	labels := map[string]string{
+		"zzz/role": "replica", "aaa/leader": "false", "mmm/primary": "no",
+	}
+	first := roleOf(labels)
+	for i := 0; i < 50; i++ {
+		if got := roleOf(labels); got != first {
+			t.Fatalf("roleOf varied between calls: %q then %q", first, got)
+		}
+	}
+}
+
+// The operator's own vocabulary is preserved: a normalised guess is the kind of
+// confidently-wrong that hurts during a recovery.
+func TestRoleKeepsTheOperatorsWording(t *testing.T) {
+	got := roleOf(map[string]string{"cnpg.io/instanceRole": "primary"})
+	if got != "cnpg.io/instanceRole=primary" {
+		t.Fatalf("role = %q, want the label verbatim", got)
 	}
 }

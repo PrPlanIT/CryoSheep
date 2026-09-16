@@ -130,7 +130,8 @@ type StatefulPod struct {
 	Namespace string
 	Name      string
 	Owner     string // controlling StatefulSet or Cluster, where there is one
-	Role      string // e.g. "primary", "replica", or empty
+	Role      string // the workload's own label, as "key=value", or empty
+	Priority  string // priorityClassName, the platform's statement of what matters
 }
 
 type Kube interface {

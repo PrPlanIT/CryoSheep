@@ -197,6 +197,9 @@ func describePods(pods []core.StatefulPod) string {
 		if p.Owner != "" {
 			b.WriteString(" (" + p.Owner + ")")
 		}
+		if p.Priority != "" {
+			b.WriteString(" prio=" + p.Priority)
+		}
 	}
 	return b.String()
 }
