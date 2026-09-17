@@ -357,3 +357,24 @@ func TestNoKubeconfigMeansNoFlag(t *testing.T) {
 		}
 	}
 }
+
+// ExecStop fires whenever the unit stops, including by hand. Only "stopping"
+// means the machine is actually going down; anything else must be refused, or
+// `systemctl stop` would cordon a healthy node and release its mounts.
+func TestOnlyStoppingCountsAsAShutdown(t *testing.T) {
+	for word, want := range map[string]bool{
+		"stopping":    true,
+		"running":     false,
+		"degraded":    false,
+		"starting":    false,
+		"maintenance": false,
+		"":            false,
+	} {
+		r := &Runner{Run: func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+			return []byte(word + "\n"), nil
+		}}
+		if got := r.SystemStopping(context.Background()); got != want {
+			t.Fatalf("is-system-running=%q read as stopping=%v, want %v", word, got, want)
+		}
+	}
+}

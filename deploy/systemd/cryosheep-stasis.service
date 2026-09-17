@@ -1,0 +1,43 @@
+[Unit]
+Description=Orderly stasis before this machine stops
+Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+
+# Shutdown ordering is the reverse of startup ordering. Ordering *after* these at
+# boot is what makes this stop *before* them at shutdown — while the API server
+# is still reachable, the mounts still exist, and the network is still up. Get
+# this wrong and the teardown runs against a machine that can no longer reach
+# anything it needs.
+#
+# Units that are not installed here are simply ignored, so one file serves a
+# Kubernetes node and a Proxmox host without being told which it is.
+Wants=network-online.target
+After=network-online.target network.target
+After=kubelet.service crio.service containerd.service
+After=pve-cluster.service pve-guests.service ceph.target
+
+[Service]
+# The work is in ExecStop, which is what makes this fire however the machine is
+# being stopped: poweroff, reboot, ACPI from `qm shutdown`, or the reboot inside
+# ansible's patch cycle. systemd does not care why it is stopping a unit, and
+# neither does this.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/cryosheep sleep
+
+# CryoSheep bounds its own sequence at fifteen minutes. This is the outer
+# backstop a minute later, so its own timeout fires first and it exits having
+# recorded why, rather than being killed mid-step with nothing written.
+TimeoutStopSec=16min
+
+# The one policy number, and the only thing here worth editing per host. It is
+# the deadline after which the UPS cuts power regardless of what finished — take
+# it from `cryosheep calibrate`, never guess it. Unset means no hardware backstop.
+#Environment=CRYOSHEEP_UPS_DEADLINE=5m30s
+
+# Only needed where the node's own kubelet.conf is not the right identity;
+# CryoSheep finds /etc/kubernetes/kubelet.conf on its own.
+#Environment=CRYOSHEEP_KUBECONFIG=/etc/kubernetes/admin.conf
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+[Unit]
+Description=Revive this machine after stasis
+Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+
+# Uncordoning needs the API server, so this waits for the network. On a node that
+# was cut mid-sequence there is nothing else that will do it: the machine comes
+# back still cordoned, and stays that way until something uncordons it.
+Wants=network-online.target
+After=network-online.target
+After=kubelet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cryosheep wake
+RemainAfterExit=no
+
+# Generous, because this waits on a cluster that is itself coming back. Failing
+# here is visible — the node stays SchedulingDisabled — and `cryosheep wake` can
+# simply be run again.
+TimeoutStartSec=11min
+
+[Install]
+WantedBy=multi-user.target

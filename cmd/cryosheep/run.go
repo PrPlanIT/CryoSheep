@@ -255,7 +255,18 @@ func runSleep(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	p, e, _ := f.build(ctx)
+	p, e, runner := f.build(ctx)
+
+	// systemd asked, but is the machine actually going down?
+	//
+	// ExecStop fires whenever the unit stops, including when an operator runs
+	// `systemctl stop`. Acting on that would cordon a healthy node and release
+	// its mounts because somebody restarted a service. systemd knows whether a
+	// shutdown is in progress, so ask it rather than assume.
+	if f.trigger == audit.TriggerSystemd && !runner.SystemStopping(ctx) {
+		fmt.Println("sleep: the unit stopped but the machine is not shutting down — nothing to do")
+		return 0
+	}
 
 	// Why we are stopping decides whether power returning matters.
 	//

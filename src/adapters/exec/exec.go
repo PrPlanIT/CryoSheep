@@ -59,6 +59,17 @@ func (r *Runner) IsActive(ctx context.Context, unit string) (bool, error) {
 	return strings.TrimSpace(string(out)) == "active", nil
 }
 
+// SystemStopping reports whether the machine is actually on its way down.
+//
+// The shutdown handler runs from a unit's ExecStop, and ExecStop also fires when
+// somebody stops that unit by hand. Without this check `systemctl stop` would
+// cordon a healthy node and release its mounts for no reason. systemd knows the
+// difference and says so, so the handler asks rather than assuming.
+func (r *Runner) SystemStopping(ctx context.Context) bool {
+	out, _ := r.Run(ctx, "systemctl", "is-system-running")
+	return strings.TrimSpace(string(out)) == "stopping"
+}
+
 // Guests lists this host's VMs, with each running guest's Proxmox startup order.
 //
 // The order needs a second call per guest: `qm list` does not carry it. Only
