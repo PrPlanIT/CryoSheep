@@ -91,16 +91,48 @@ type Log struct {
 	started time.Time
 	starts  []time.Time // per step, to compute elapsed at the end
 
-	out  io.Writer
-	sync func() error
-	now  func() time.Time
+	out    io.Writer
+	sync   func() error
+	now    func() time.Time
+	detach func() // closes the journal pipe, when we opened one
 }
 
 // Open begins a run. The first line is written and synced immediately, so a
 // machine that loses power before the first step still leaves evidence that a
 // run began at all.
+//
+// Under systemd, stderr is already a journal stream and writing to it is enough.
+// Run from a shell it is not — the lines go to the terminal and journald never
+// sees them, which would leave cancel and wake with no record of what to undo.
+// A run started by hand must be as reversible as one started by a unit, so when
+// stderr is not already going to the journal we send a copy there ourselves.
 func Open(host, trigger string) *Log {
-	return open(os.Stderr, journalSync, time.Now, host, trigger)
+	out := io.Writer(os.Stderr)
+	var detach func()
+	if os.Getenv("JOURNAL_STREAM") == "" {
+		if w, stop, ok := journalPipe(); ok {
+			out = io.MultiWriter(os.Stderr, w)
+			detach = stop
+		}
+	}
+	l := open(out, journalSync, time.Now, host, trigger)
+	l.detach = detach
+	return l
+}
+
+// journalPipe holds one systemd-cat open for the life of the run. One process,
+// not one per line: the per-line cost is already a sync, and a second fork for
+// every step would be felt in a sequence that is racing a battery.
+func journalPipe() (io.Writer, func(), bool) {
+	cmd := exec.Command("systemd-cat", "-t", Identifier)
+	w, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, false
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, nil, false
+	}
+	return w, func() { _ = w.Close(); _ = cmd.Wait() }, true
 }
 
 func open(out io.Writer, sync func() error, now func() time.Time, host, trigger string) *Log {
@@ -173,6 +205,14 @@ func (l *Log) Close(complete, aborted bool) error {
 		Complete:   &c,
 		Aborted:    &a,
 	})
+	// Close the pipe before the last sync, so what it is still holding is on
+	// disk rather than in flight when this process ends.
+	if l.detach != nil {
+		l.detach()
+		if l.sync != nil {
+			_ = l.sync()
+		}
+	}
 	return nil
 }
 

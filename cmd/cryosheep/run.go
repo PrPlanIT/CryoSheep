@@ -31,8 +31,38 @@ type runFlags struct {
 	dryRun      bool
 	upsDeadline time.Duration
 
+	// kubeconfig names the identity kubectl should use. See resolveKubeconfig.
+	kubeconfig string
+
 	// trigger is detected, not parsed — see detectTrigger.
 	trigger string
+}
+
+// kubeletConf is the node's own kubelet identity. A kubelet may patch its own
+// Node object, which is all the k8s teardown needs, so this is the right default
+// for a unit that must work with no operator credentials present.
+const kubeletConf = "/etc/kubernetes/kubelet.conf"
+
+// resolveKubeconfig finds an identity for kubectl, most explicit first.
+//
+// The fallback to the kubelet's own config is what lets the shutdown handler
+// work under systemd, where there is no KUBECONFIG and no HOME. Without it
+// kubectl quietly tries localhost:8080 and every k8s step becomes a no-op that
+// still reports success.
+func resolveKubeconfig(flagValue string) string {
+	for _, c := range []string{
+		flagValue,
+		os.Getenv("CRYOSHEEP_KUBECONFIG"),
+		os.Getenv("KUBECONFIG"),
+	} {
+		if c != "" {
+			return c
+		}
+	}
+	if _, err := os.Stat(kubeletConf); err == nil {
+		return kubeletConf
+	}
+	return ""
 }
 
 func (f *runFlags) bind(fs *flag.FlagSet) {
@@ -41,6 +71,8 @@ func (f *runFlags) bind(fs *flag.FlagSet) {
 		"walk and record the decisions without performing them")
 	fs.DurationVar(&f.upsDeadline, "ups-deadline", envDuration("CRYOSHEEP_UPS_DEADLINE"),
 		"when the UPS cuts power regardless of the sequence; 0 disables")
+	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
+		"identity for kubectl; defaults to $CRYOSHEEP_KUBECONFIG, $KUBECONFIG, then "+kubeletConf)
 }
 
 // envDuration lets the one policy number be set per host in the unit file, where
@@ -94,7 +126,21 @@ func upsFor() (*nut.Client, bool) {
 func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *exec.Runner) {
 	host, _ := os.Hostname()
 	runner := exec.New()
+	runner.Kubeconfig = resolveKubeconfig(f.kubeconfig)
 	roles := detect.Roles(ctx, runner)
+
+	// Said loudly because the alternative is silence. Without an identity every
+	// kubernetes step still reports success while doing nothing, and the node
+	// goes down uncordoned with its mounts held.
+	if runner.Kubeconfig == "" {
+		for _, r := range roles {
+			if r == core.RoleKubelet {
+				fmt.Fprintf(os.Stderr,
+					"warning: this node runs kubelet but no kubeconfig was found — "+
+						"cordon and the quorum record will not work; set --kubeconfig or CRYOSHEEP_KUBECONFIG\n")
+			}
+		}
+	}
 
 	var guests []core.Guest
 	for _, r := range roles {
@@ -279,6 +325,7 @@ func runWake(args []string) int {
 // to clear.
 func undoRun(ctx context.Context, f runFlags, run audit.Run) int {
 	runner := exec.New()
+	runner.Kubeconfig = resolveKubeconfig(f.kubeconfig)
 	ups, _ := upsFor()
 
 	undone := 0

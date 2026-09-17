@@ -3,6 +3,7 @@ package audit
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,30 @@ func TestNoteIsBounded(t *testing.T) {
 	})
 	if n := len(parseRuns(out)[0].Steps[0].Note); n > MaxNote {
 		t.Fatalf("note is %d bytes, over the %d budget", n, MaxNote)
+	}
+}
+
+// A run started by hand must be as reversible as one started by a unit. Under
+// systemd stderr is already a journal stream; from a shell it is not, and
+// without a copy going to journald cancel and wake would find no record of what
+// to undo — leaving a node cordoned with nothing able to fix it.
+func TestShellStartedRunAlsoReachesTheJournal(t *testing.T) {
+	t.Setenv("JOURNAL_STREAM", "")
+
+	var term, journal bytes.Buffer
+	l := open(io.MultiWriter(&term, &journal), nil, clock(time.Second), "host-a", TriggerManual)
+	i := l.StepStart("k8s.cordon", "host-a", "")
+	l.StepEnd(i, OutcomeDone, nil)
+	_ = l.Close(true, false)
+
+	runs := parseRuns(journal.String())
+	if len(runs) != 1 || len(runs[0].Steps) != 1 {
+		t.Fatalf("journal copy is not reversible: %+v", runs)
+	}
+	if runs[0].Steps[0].Outcome != OutcomeDone {
+		t.Fatalf("step outcome lost in the journal copy: %+v", runs[0].Steps[0])
+	}
+	if term.Len() == 0 {
+		t.Fatal("nothing written to the terminal — the operator sees no output")
 	}
 }

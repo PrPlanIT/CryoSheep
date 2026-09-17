@@ -316,3 +316,44 @@ func TestRoleKeepsTheOperatorsWording(t *testing.T) {
 		t.Fatalf("role = %q, want the label verbatim", got)
 	}
 }
+
+// Under systemd there is no KUBECONFIG and no HOME, so kubectl falls back to
+// localhost:8080 and every k8s step becomes a no-op that still reports success.
+// Naming the identity on the command line is what prevents that.
+func TestKubeconfigIsPassedToKubectl(t *testing.T) {
+	var got []string
+	r := &Runner{
+		Kubeconfig: "/etc/kubernetes/kubelet.conf",
+		Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			got = args
+			return nil, nil
+		},
+	}
+	if err := r.Cordon(context.Background(), "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 2 || got[0] != "--kubeconfig" || got[1] != "/etc/kubernetes/kubelet.conf" {
+		t.Fatalf("kubeconfig not passed: %v", got)
+	}
+	if got[len(got)-2] != "cordon" || got[len(got)-1] != "node-a" {
+		t.Fatalf("the actual command was lost: %v", got)
+	}
+}
+
+// An operator at a shell has an environment; leaving the flag off must not
+// invent one.
+func TestNoKubeconfigMeansNoFlag(t *testing.T) {
+	var got []string
+	r := &Runner{Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		got = args
+		return nil, nil
+	}}
+	if err := r.Uncordon(context.Background(), "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range got {
+		if a == "--kubeconfig" {
+			t.Fatalf("invented a kubeconfig: %v", got)
+		}
+	}
+}

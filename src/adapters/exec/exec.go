@@ -26,6 +26,23 @@ import (
 type Runner struct {
 	// Run is swappable so the parsers can be tested without a hypervisor.
 	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+	// Kubeconfig is passed to kubectl explicitly rather than left to the
+	// environment. Under systemd there is no KUBECONFIG and no HOME, so kubectl
+	// falls back to localhost:8080, fails to connect, and the node is never
+	// cordoned — a silent no-op in the one path that has to work. Naming it here
+	// makes the dependency visible and its absence reportable.
+	Kubeconfig string
+}
+
+// kubectl builds an argument list with the kubeconfig in front, when one is
+// known. Empty means "whatever the environment says", which is right for an
+// operator at a shell and wrong for a unit.
+func (r *Runner) kubectl(args ...string) []string {
+	if r.Kubeconfig == "" {
+		return args
+	}
+	return append([]string{"--kubeconfig", r.Kubeconfig}, args...)
 }
 
 func New() *Runner {
@@ -171,14 +188,14 @@ func (r *Runner) Shutdown(ctx context.Context, id string, timeout time.Duration)
 
 // Cordon stops the scheduler placing new work on a node that is leaving.
 func (r *Runner) Cordon(ctx context.Context, node string) error {
-	if _, err := r.Run(ctx, "kubectl", "cordon", node); err != nil {
+	if _, err := r.Run(ctx, "kubectl", r.kubectl("cordon", node)...); err != nil {
 		return fmt.Errorf("kubectl cordon %s: %w", node, err)
 	}
 	return nil
 }
 
 func (r *Runner) Uncordon(ctx context.Context, node string) error {
-	if _, err := r.Run(ctx, "kubectl", "uncordon", node); err != nil {
+	if _, err := r.Run(ctx, "kubectl", r.kubectl("uncordon", node)...); err != nil {
 		return fmt.Errorf("kubectl uncordon %s: %w", node, err)
 	}
 	return nil
@@ -187,8 +204,8 @@ func (r *Runner) Uncordon(ctx context.Context, node string) error {
 // StatefulPods lists the stateful workloads on this node and the role each
 // claims, so a revival has something to start from.
 func (r *Runner) StatefulPods(ctx context.Context, node string) ([]core.StatefulPod, error) {
-	out, err := r.Run(ctx, "kubectl", "get", "pods", "--all-namespaces",
-		"--field-selector", "spec.nodeName="+node, "-o", "json")
+	out, err := r.Run(ctx, "kubectl", r.kubectl("get", "pods", "--all-namespaces",
+		"--field-selector", "spec.nodeName="+node, "-o", "json")...)
 	if err != nil {
 		return nil, fmt.Errorf("kubectl get pods: %w", err)
 	}
