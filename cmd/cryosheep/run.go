@@ -263,7 +263,9 @@ func runSleep(args []string) int {
 	// `systemctl stop`. Acting on that would cordon a healthy node and release
 	// its mounts because somebody restarted a service. systemd knows whether a
 	// shutdown is in progress, so ask it rather than assume.
-	if f.trigger == audit.TriggerSystemd && !runner.SystemStopping(ctx) {
+	// A rehearsal performs nothing, so refusing it protects nobody and prevents
+	// the only way to see this path before trusting it on a real shutdown.
+	if !f.dryRun && f.trigger == audit.TriggerSystemd && !runner.SystemStopping(ctx) {
 		fmt.Println("sleep: the unit stopped but the machine is not shutting down — nothing to do")
 		return 0
 	}

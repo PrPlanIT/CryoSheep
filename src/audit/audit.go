@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -92,6 +93,7 @@ type Log struct {
 	starts  []time.Time // per step, to compute elapsed at the end
 
 	out    io.Writer
+	human  io.Writer // nil when the operator is not watching
 	sync   func() error
 	now    func() time.Time
 	detach func() // closes the journal pipe, when we opened one
@@ -108,15 +110,20 @@ type Log struct {
 // stderr is not already going to the journal we send a copy there ourselves.
 func Open(host, trigger string) *Log {
 	out := io.Writer(os.Stderr)
+	var human io.Writer
 	var detach func()
+
 	if os.Getenv("JOURNAL_STREAM") == "" {
+		// Nobody is piping stderr into the journal for us, so send the record
+		// there ourselves — and give the terminal something a person can read
+		// instead of the same JSON they cannot parse at a glance.
 		if w, stop, ok := journalPipe(); ok {
-			out = io.MultiWriter(os.Stderr, w)
-			detach = stop
+			out, human, detach = w, os.Stderr, stop
 		}
 	}
+
 	l := open(out, journalSync, time.Now, host, trigger)
-	l.detach = detach
+	l.human, l.detach = human, detach
 	return l
 }
 
@@ -226,6 +233,11 @@ func (l *Log) write(rec line) {
 		return
 	}
 	fmt.Fprintf(l.out, "%s\n", b)
+	if l.human != nil {
+		if line := readable(rec); line != "" {
+			fmt.Fprintln(l.human, line)
+		}
+	}
 
 	// Durability is the whole reason this package exists rather than a plain
 	// logger. A failure here is not fatal: losing the guarantee is better than
@@ -233,6 +245,45 @@ func (l *Log) write(rec line) {
 	if l.sync != nil {
 		_ = l.sync()
 	}
+}
+
+// readable renders one line for a person at a terminal. The JSON is the record;
+// this is the running commentary, and it exists because an operator rehearsing a
+// shutdown should be able to see what happened without a parser.
+func readable(rec line) string {
+	at := rec.Time[11:19]
+	switch rec.Event {
+	case evStepStart:
+		return fmt.Sprintf("%s  %-18s %s", at, short(rec.Action), rec.Target)
+	case evStepEnd:
+		if rec.Note != "" {
+			n := strings.Count(rec.Note, "\n") + 1
+			return fmt.Sprintf("%s  %-18s recorded %d workloads", at, "", n)
+		}
+		out := fmt.Sprintf("%s  %-18s %-8s %6dms", at, "", rec.Outcome, rec.ElapsedMS)
+		if rec.Err != "" {
+			out += "  " + rec.Err
+		}
+		return out
+	case evRunEnd:
+		state := "complete"
+		if rec.Aborted != nil && *rec.Aborted {
+			state = "abandoned"
+		} else if rec.Complete != nil && !*rec.Complete {
+			state = "incomplete"
+		}
+		return fmt.Sprintf("%s  %-18s %s in %dms", at, "run", state, rec.DurationMS)
+	}
+	return ""
+}
+
+// short drops the namespace from an action, which is repeated on every line and
+// carries nothing once you know what you are reading.
+func short(action string) string {
+	if _, rest, ok := strings.Cut(action, "."); ok {
+		return rest
+	}
+	return action
 }
 
 // journalSync asks journald to flush everything it holds to the filesystem and

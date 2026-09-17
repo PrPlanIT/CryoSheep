@@ -297,3 +297,20 @@ func TestPointOfNoReturnSurvivesOmitHalt(t *testing.T) {
 		t.Fatalf("point of no return is %q, want k8s.csi.unmount", p.Steps[pnr].Action)
 	}
 }
+
+// The systemd path is the one that runs most often and the one nobody can watch,
+// so it has to be rehearsable. A plan built for it must still describe the whole
+// teardown — only the halt is absent.
+func TestSystemdPlanStillDescribesTheWholeTeardown(t *testing.T) {
+	p := Build("node-a", []core.Role{core.RoleKubelet, core.RoleCephOSD}, nil, "OB",
+		Options{UPSDeadline: time.Minute, OmitHalt: true})
+	want := []Action{ActionUPSDeadline, ActionCephNoout, ActionK8sRecord, ActionK8sCordon, ActionK8sUnmount}
+	if len(p.Steps) != len(want) {
+		t.Fatalf("got %d steps, want %d: %+v", len(p.Steps), len(want), p.Steps)
+	}
+	for i, a := range want {
+		if p.Steps[i].Action != a {
+			t.Fatalf("step %d is %q, want %q", i, p.Steps[i].Action, a)
+		}
+	}
+}

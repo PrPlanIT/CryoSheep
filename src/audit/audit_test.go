@@ -181,3 +181,39 @@ func TestShellStartedRunAlsoReachesTheJournal(t *testing.T) {
 		t.Fatal("nothing written to the terminal — the operator sees no output")
 	}
 }
+
+// The JSON is the record; the terminal gets prose. An operator rehearsing a
+// shutdown should not have to parse what they are watching.
+func TestTerminalGetsProseAndTheJournalGetsJSON(t *testing.T) {
+	var journal, term bytes.Buffer
+	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd)
+	l.human = &term
+	i := l.StepStart("k8s.cordon", "host-a", "")
+	l.StepEnd(i, OutcomeDone, nil)
+	_ = l.Close(true, false)
+
+	if !strings.Contains(journal.String(), `"ev":"step.end"`) {
+		t.Fatalf("journal is not machine-readable:\n%s", journal.String())
+	}
+	if strings.Contains(term.String(), `{"`) {
+		t.Fatalf("raw JSON leaked to the terminal:\n%s", term.String())
+	}
+	for _, want := range []string{"cordon", "host-a", "done", "complete"} {
+		if !strings.Contains(term.String(), want) {
+			t.Fatalf("terminal output missing %q:\n%s", want, term.String())
+		}
+	}
+}
+
+// Under systemd stderr is the journal, so prose there would corrupt the record.
+func TestNoProseWhenStderrIsTheJournal(t *testing.T) {
+	var journal bytes.Buffer
+	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd)
+	i := l.StepStart("k8s.cordon", "host-a", "")
+	l.StepEnd(i, OutcomeDone, nil)
+	for _, ln := range strings.Split(strings.TrimSpace(journal.String()), "\n") {
+		if !strings.HasPrefix(ln, "{") {
+			t.Fatalf("non-JSON line in the record: %q", ln)
+		}
+	}
+}
