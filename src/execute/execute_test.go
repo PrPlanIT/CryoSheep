@@ -3,6 +3,8 @@ package execute
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -401,5 +403,47 @@ func TestPowerLossSleepAbandonsWhenTheReasonIsGone(t *testing.T) {
 	}
 	if dl.cancelled != 1 {
 		t.Fatalf("deadline cancelled %d times, want 1", dl.cancelled)
+	}
+}
+
+// The record's budget is finite, so the lines that answer "which instance was
+// authoritative" must be written before the ones that merely list what was here.
+func TestDescribePodsWritesRoleBearingWorkloadsFirst(t *testing.T) {
+	pods := []core.StatefulPod{
+		{Namespace: "a", Name: "plain-0", Owner: "StatefulSet/plain"},
+		{Namespace: "b", Name: "pg-1", Owner: "Cluster/pg", Role: "cnpg.io/instanceRole=primary"},
+	}
+	got := describePods(pods)
+	first := strings.Split(got, "\n")[0]
+	if !strings.Contains(first, "pg-1") {
+		t.Fatalf("role-bearing workload not written first:\n%s", got)
+	}
+}
+
+// A record that simply ends looks complete. One that says what it dropped sends
+// the reader to the cluster for the rest.
+func TestDescribePodsCountsWhatItCouldNotFit(t *testing.T) {
+	var pods []core.StatefulPod
+	for i := 0; i < 400; i++ {
+		pods = append(pods, core.StatefulPod{
+			Namespace: "namespace-with-a-long-name",
+			Name:      fmt.Sprintf("workload-%03d", i),
+			Owner:     "StatefulSet/workload",
+		})
+	}
+	got := describePods(pods)
+	if len(got) > journal.MaxNote {
+		t.Fatalf("note is %d bytes, over the %d budget", len(got), journal.MaxNote)
+	}
+	if !strings.Contains(got, "more not recorded") {
+		t.Fatalf("omission went unreported:\n%s", got[len(got)-120:])
+	}
+}
+
+// Everything fitting means nothing is claimed to be missing.
+func TestDescribePodsReportsNoOmissionWhenAllFit(t *testing.T) {
+	pods := []core.StatefulPod{{Namespace: "a", Name: "only-0", Owner: "StatefulSet/only"}}
+	if got := describePods(pods); strings.Contains(got, "more not recorded") {
+		t.Fatalf("claimed an omission that did not happen: %q", got)
 	}
 }

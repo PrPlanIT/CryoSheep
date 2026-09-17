@@ -43,9 +43,12 @@ const (
 // kilobyte record into a megabyte one.
 const maxErr = 200
 
-// maxNote bounds recorded evidence. Generous enough for the stateful workloads
-// of one node, small enough that a run stays a kilobyte.
-const maxNote = 2000
+// MaxNote bounds recorded evidence. A real worker carries around thirty stateful
+// workloads, and the first drill overran two kilobytes and severed a CNPG
+// replica mid-line — losing exactly the evidence the record exists to keep. The
+// budget is the caller's to spend, so it is exported: the writer decides what to
+// drop, rather than having the tail cut off blindly here.
+const MaxNote = 4000
 
 // KeepDefault is how many runs are retained. Enough for calibration to have a
 // distribution, few enough that the directory never needs thinking about.
@@ -136,7 +139,7 @@ func (w *Writer) Note(i int, note string) {
 	if i < 0 || i >= len(w.run.Steps) {
 		return
 	}
-	w.run.Steps[i].Note = truncate(note, maxNote)
+	w.run.Steps[i].Note = truncate(note, MaxNote)
 	_ = w.flush()
 }
 

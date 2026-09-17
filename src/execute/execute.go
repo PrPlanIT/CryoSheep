@@ -22,6 +22,8 @@ package execute
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -178,28 +180,57 @@ func (e *Executor) performAt(ctx context.Context, s plan.Step, rec Recorder, idx
 	return e.perform(ctx, s)
 }
 
-// describePods renders the record compactly: one workload per line, role first
-// so the authoritative ones are findable by eye in an incident.
+// describePods renders the record compactly, one workload per line.
+//
+// Workloads that claim a role are written first. They are the only lines that
+// answer the question the record exists for — which instance was authoritative
+// — and the budget is finite, so they must not be crowded out by workloads that
+// merely happened to be here. The first drill did exactly that: thirty lines, of
+// which nine carried a role, and the cut landed mid-way through a CNPG replica.
+//
+// What does not fit is counted rather than dropped in silence. A record that
+// says it omitted seven workloads sends a reader to the cluster; one that simply
+// ends looks complete and is not.
 func describePods(pods []core.StatefulPod) string {
 	if len(pods) == 0 {
 		return "no stateful workloads on this node"
 	}
-	var b strings.Builder
-	for i, p := range pods {
-		if i > 0 {
-			b.WriteByte('\n')
-		}
+
+	ordered := make([]core.StatefulPod, len(pods))
+	copy(ordered, pods)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].Role != "" && ordered[j].Role == ""
+	})
+
+	line := func(p core.StatefulPod) string {
 		role := p.Role
 		if role == "" {
 			role = "-"
 		}
-		b.WriteString(role + " " + p.Namespace + "/" + p.Name)
+		s := role + " " + p.Namespace + "/" + p.Name
 		if p.Owner != "" {
-			b.WriteString(" (" + p.Owner + ")")
+			s += " (" + p.Owner + ")"
 		}
 		if p.Priority != "" {
-			b.WriteString(" prio=" + p.Priority)
+			s += " prio=" + p.Priority
 		}
+		return s
+	}
+
+	// Leave room for the omission notice, so recording that something was
+	// dropped can never itself be the thing that gets dropped.
+	const reserve = 40
+	var b strings.Builder
+	for i, p := range ordered {
+		l := line(p)
+		if b.Len()+len(l)+1 > journal.MaxNote-reserve {
+			fmt.Fprintf(&b, "\n+%d more not recorded", len(ordered)-i)
+			break
+		}
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(l)
 	}
 	return b.String()
 }
