@@ -246,3 +246,54 @@ func TestHypervisorGetsNoKubeSteps(t *testing.T) {
 		}
 	}
 }
+
+// Run as a systemd shutdown handler, the transition is already in flight. A
+// poweroff here races it, and on a reboot turns it into a machine that never
+// comes back — a node patched by ansible, dark until somebody walks to it.
+func TestOmitHaltLeavesTheFinalPoweroffOut(t *testing.T) {
+	roles := []core.Role{core.RoleKubelet}
+	p := Build("node-a", roles, nil, "OL", Options{OmitHalt: true})
+	for _, s := range p.Steps {
+		if s.Action == ActionHostHalt {
+			t.Fatalf("host.poweroff planned while systemd is already stopping the machine:\n%+v", p.Steps)
+		}
+	}
+}
+
+func TestHaltIsPlannedWhenNothingElseIsStoppingUs(t *testing.T) {
+	p := Build("node-a", []core.Role{core.RoleKubelet}, nil, "OB", Options{})
+	last := p.Steps[len(p.Steps)-1]
+	if last.Action != ActionHostHalt {
+		t.Fatalf("last step is %q, want host.poweroff", last.Action)
+	}
+}
+
+// Omitting the halt must not quietly change the teardown that precedes it —
+// that work is the whole reason the handler runs at all.
+func TestOmitHaltChangesNothingBeforeIt(t *testing.T) {
+	roles := []core.Role{core.RoleKubelet, core.RoleCephOSD}
+	guests := []core.Guest{{ID: "100", Name: "pfsense", Status: "running", Order: 1}}
+	full := Build("h", roles, guests, "OB", Options{UPSDeadline: time.Minute})
+	short := Build("h", roles, guests, "OB", Options{UPSDeadline: time.Minute, OmitHalt: true})
+
+	if len(short.Steps) != len(full.Steps)-1 {
+		t.Fatalf("got %d steps, want %d", len(short.Steps), len(full.Steps)-1)
+	}
+	for i := range short.Steps {
+		if short.Steps[i] != full.Steps[i] {
+			t.Fatalf("step %d differs:\n  %+v\n  %+v", i, short.Steps[i], full.Steps[i])
+		}
+	}
+}
+
+// Releasing storage is irreversible whether or not we are the ones halting.
+func TestPointOfNoReturnSurvivesOmitHalt(t *testing.T) {
+	p := Build("node-a", []core.Role{core.RoleKubelet}, nil, "OB", Options{OmitHalt: true})
+	pnr := p.PointOfNoReturn()
+	if pnr >= len(p.Steps) {
+		t.Fatalf("no irreversible step found in %+v", p.Steps)
+	}
+	if p.Steps[pnr].Action != ActionK8sUnmount {
+		t.Fatalf("point of no return is %q, want k8s.csi.unmount", p.Steps[pnr].Action)
+	}
+}

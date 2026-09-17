@@ -56,6 +56,15 @@ type Options struct {
 	// regardless of what the sequence managed to do. Zero omits the step, for a
 	// host with no authority over the UPS.
 	UPSDeadline time.Duration
+
+	// OmitHalt leaves the final poweroff out, because something else is already
+	// stopping this machine.
+	//
+	// This is what separates a shutdown from a reboot. Run as a systemd shutdown
+	// handler, the transition is already in flight — halting here either races
+	// it or, on a reboot, turns it into a poweroff and the machine never comes
+	// back. The teardown is still the whole point; ending it is not ours to do.
+	OmitHalt bool
 }
 
 func (o Options) withDefaults() Options {
@@ -205,6 +214,8 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 		})
 	}
 
-	p.Steps = append(p.Steps, Step{Action: ActionHostHalt, Detail: host})
+	if !opts.OmitHalt {
+		p.Steps = append(p.Steps, Step{Action: ActionHostHalt, Detail: host})
+	}
 	return p
 }

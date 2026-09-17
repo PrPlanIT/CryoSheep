@@ -30,9 +30,13 @@ const guestFallback = 90 * time.Second
 type runFlags struct {
 	dryRun      bool
 	upsDeadline time.Duration
+
+	// trigger is detected, not parsed — see detectTrigger.
+	trigger string
 }
 
 func (f *runFlags) bind(fs *flag.FlagSet) {
+	f.trigger = detectTrigger()
 	fs.BoolVar(&f.dryRun, "dry-run", false,
 		"walk and record the decisions without performing them")
 	fs.DurationVar(&f.upsDeadline, "ups-deadline", envDuration("CRYOSHEEP_UPS_DEADLINE"),
@@ -120,7 +124,14 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		}
 	}
 
-	opts := plan.Options{GuestTimeout: guestFallback, UPSDeadline: f.upsDeadline}
+	opts := plan.Options{
+		GuestTimeout: guestFallback,
+		UPSDeadline:  f.upsDeadline,
+		// systemd invoked us from a unit it is already stopping, so the poweroff
+		// or reboot is in flight. Halting on top of that turns a reboot into a
+		// poweroff — a node patched by ansible would never come back.
+		OmitHalt: f.trigger == audit.TriggerSystemd,
+	}
 	p := plan.Build(host, roles, guests, status, opts)
 	e := &execute.Executor{Hyp: runner, UPS: ups, Ceph: runner, Kube: runner, Host: runner,
 		Deadline: deadline, DryRun: f.dryRun}
@@ -198,7 +209,6 @@ func runSleep(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
-	trigger := detectTrigger()
 	p, e, _ := f.build(ctx)
 
 	// Why we are stopping decides whether power returning matters.
@@ -208,9 +218,9 @@ func runSleep(args []string) int {
 	// An operator or a systemd reboot asked for this, and the UPS reporting
 	// healthy power is simply not news — gating there would abandon a shutdown
 	// that was requested, leaving guests running while the host stops under them.
-	e.NoGate = trigger != audit.TriggerUPS
+	e.NoGate = f.trigger != audit.TriggerUPS
 
-	w := audit.Open(p.Host, trigger)
+	w := audit.Open(p.Host, f.trigger)
 	e.Record = w
 
 	res := e.Run(ctx, p)

@@ -131,6 +131,17 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 		fmt.Printf("\npoint of no return: step %d — power returning before it aborts and reverses\n", pnr+1)
 	}
 
+	// Said here because the difference is invisible otherwise: this is the plan
+	// for a stop somebody asked for. Run as a systemd shutdown handler the same
+	// sequence stops one step earlier, because systemd is already halting or
+	// rebooting and a second poweroff would turn a reboot into a dark machine.
+	for _, st := range p.Steps {
+		if st.Action == plan.ActionHostHalt {
+			fmt.Println("under systemd: host.poweroff is omitted — systemd is already stopping the machine")
+			break
+		}
+	}
+
 	// Guests stop in reverse startup order. With none set the order is whatever
 	// qm list returned, which is VMID ascending — so a firewall on a low VMID
 	// would be the first thing stopped.
