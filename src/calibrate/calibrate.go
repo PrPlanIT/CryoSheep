@@ -10,16 +10,14 @@
 package calibrate
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
-	"strings"
 	"time"
+
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 )
 
-// Run is one completed sequence, as reconstructed from a run journal.
+// Run is one completed sequence, as reconstructed from the journal.
 type Run struct {
 	ID       string
 	Host     string
@@ -131,28 +129,16 @@ func Feasible(r Recommendation, runtimeNow time.Duration) (bool, string) {
 	return true, ""
 }
 
-// LoadRuns reads run journals from disk. A journal that cannot be parsed is
-// skipped rather than fatal: one corrupt record from a run that was cut mid-write
-// must not stop calibration from using every other run.
-func LoadRuns(dir string) ([]Run, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
+// FromAudit converts runs reconstructed from the journal into the shape
+// calibration works on. Calibration itself stays pure — it is handed a slice and
+// never learns where the slice came from.
+func FromAudit(rs []audit.Run) []Run {
+	out := make([]Run, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, Run{
+			ID: r.ID, Host: r.Host, Started: r.Started,
+			Duration: r.Duration, Complete: r.Complete,
+		})
 	}
-	var runs []Run
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
-		if err != nil {
-			continue
-		}
-		var r Run
-		if json.Unmarshal(b, &r) != nil {
-			continue
-		}
-		runs = append(runs, r)
-	}
-	return runs, nil
+	return out
 }

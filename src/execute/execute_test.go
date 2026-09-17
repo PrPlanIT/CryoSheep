@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 	"github.com/PrPlanIT/CryoSheep/src/core"
-	"github.com/PrPlanIT/CryoSheep/src/journal"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
 )
 
@@ -234,7 +234,7 @@ func TestDryRunPerformsNothing(t *testing.T) {
 		t.Fatalf("dry run acted: ceph=%d guests=%v halted=%d", ceph.set, hyp.stopped, host.halted)
 	}
 	for _, s := range rec.steps {
-		if s.outcome != journal.OutcomeSkipped {
+		if s.outcome != audit.OutcomeSkipped {
 			t.Fatalf("dry-run step %q recorded as %q, want skipped", s.action, s.outcome)
 		}
 	}
@@ -432,8 +432,8 @@ func TestDescribePodsCountsWhatItCouldNotFit(t *testing.T) {
 		})
 	}
 	got := describePods(pods)
-	if len(got) > journal.MaxNote {
-		t.Fatalf("note is %d bytes, over the %d budget", len(got), journal.MaxNote)
+	if len(got) > audit.MaxNote {
+		t.Fatalf("note is %d bytes, over the %d budget", len(got), audit.MaxNote)
 	}
 	if !strings.Contains(got, "more not recorded") {
 		t.Fatalf("omission went unreported:\n%s", got[len(got)-120:])

@@ -2,57 +2,88 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/adapters/exec"
 	"github.com/PrPlanIT/CryoSheep/src/adapters/nut"
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 	"github.com/PrPlanIT/CryoSheep/src/core"
 	"github.com/PrPlanIT/CryoSheep/src/detect"
 	"github.com/PrPlanIT/CryoSheep/src/execute"
-	"github.com/PrPlanIT/CryoSheep/src/journal"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
 )
 
-// common flags shared by the acting subcommands.
+// guestFallback bounds a guest's ACPI shutdown when Proxmox has no `down=` for
+// it. Not configurable: Proxmox is already where a per-guest budget belongs, and
+// a flag here would only be a worse copy of a field that already exists.
+const guestFallback = 90 * time.Second
+
+// runFlags is the whole configurable surface.
+//
+// Everything else is either a constant, or something another system already
+// owns: the UPS connection lives in upsmon.conf, the per-guest budget lives in
+// Proxmox, and why we are stopping is read from the environment rather than
+// declared. A flag that can contradict the truth is worse than no flag at all.
 type runFlags struct {
-	runsDir      string
-	upsAddr      string
-	upsName      string
-	guestTimeout time.Duration
-	dryRun       bool
-	deadline     time.Duration
-	upsUser      string
-	upsPassFile  string
+	dryRun      bool
+	upsDeadline time.Duration
 }
 
 func (f *runFlags) bind(fs *flag.FlagSet) {
-	fs.StringVar(&f.runsDir, "runs", "/var/lib/cryosheep/runs", "where run journals are kept")
-	fs.StringVar(&f.upsAddr, "ups-addr", "", "NUT server host[:port]")
-	fs.StringVar(&f.upsName, "ups-name", "ups", "UPS name as upsd knows it")
-	fs.DurationVar(&f.guestTimeout, "guest-timeout", 90*time.Second, "per-guest ACPI shutdown budget")
-	fs.BoolVar(&f.dryRun, "dry-run", false, "walk and record the decisions without performing them")
-	fs.DurationVar(&f.deadline, "deadline", 0, "arm the UPS to cut power after this long regardless of the sequence; 0 disables")
-	fs.StringVar(&f.upsUser, "ups-user", "", "NUT user permitted to send instant commands")
-	fs.StringVar(&f.upsPassFile, "ups-pass-file", "", "file holding that user's password")
+	fs.BoolVar(&f.dryRun, "dry-run", false,
+		"walk and record the decisions without performing them")
+	fs.DurationVar(&f.upsDeadline, "ups-deadline", envDuration("CRYOSHEEP_UPS_DEADLINE"),
+		"when the UPS cuts power regardless of the sequence; 0 disables")
 }
 
-// password is read from a file or the environment, never from a flag: an
-// argument is visible in ps to every user on the host.
-func (f *runFlags) password() string {
-	if f.upsPassFile != "" {
-		b, err := os.ReadFile(f.upsPassFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: could not read %s: %v\n", f.upsPassFile, err)
-			return ""
-		}
-		return strings.TrimSpace(string(b))
+// envDuration lets the one policy number be set per host in the unit file, where
+// ansible can manage it, without it becoming an argument that has to be repeated
+// at every call site.
+func envDuration(key string) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
 	}
-	return os.Getenv("CRYOSHEEP_UPS_PASSWORD")
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %s=%q is not a duration, ignoring\n", key, v)
+		return 0
+	}
+	return d
+}
+
+// detectTrigger establishes why this run is happening, from the environment of
+// whatever started it.
+//
+// Read rather than declared. The caller already knows — upsmon exports
+// NOTIFYTYPE, systemd exports INVOCATION_ID — and asking it to say so again only
+// creates a way for it to say something untrue. Whether power returning matters
+// depends on this answer, so being told the wrong one is not survivable.
+func detectTrigger() string {
+	switch {
+	case os.Getenv("NOTIFYTYPE") != "":
+		return audit.TriggerUPS
+	case os.Getenv("INVOCATION_ID") != "":
+		return audit.TriggerSystemd
+	default:
+		return audit.TriggerManual
+	}
+}
+
+// upsFor opens a client from what NUT already records on this host. A machine
+// with no upsmon.conf has no UPS, which is correct for a guest: it is told to
+// stop by something else and simply stops well.
+func upsFor() (*nut.Client, bool) {
+	m, ok := nut.ReadMonitor(nut.UpsmonConf)
+	if !ok || m.Addr == "" {
+		return nil, false
+	}
+	c := nut.New(m.Addr, m.Name)
+	c.User, c.Pass = m.User, m.Pass
+	return c, true
 }
 
 // build assembles the plan and the executor for this host.
@@ -75,8 +106,7 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	status := "unknown"
 	var ups core.UPS
 	var deadline core.Deadline
-	if f.upsAddr != "" {
-		c := nut.New(f.upsAddr, f.upsName)
+	if c, ok := upsFor(); ok {
 		ups = c
 		if r, err := c.Read(ctx); err == nil {
 			status = r.Status
@@ -85,16 +115,12 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		}
 		// The backstop needs an authenticated user; without one the deadline
 		// step is planned but skipped, and the run records that it was.
-		if pw := f.password(); f.upsUser != "" && pw != "" {
-			c.User, c.Pass = f.upsUser, pw
+		if c.User != "" && c.Pass != "" {
 			deadline = c
 		}
 	}
 
-	opts := plan.Options{
-		GuestTimeout: f.guestTimeout,
-		UPSDeadline:  f.deadline,
-	}
+	opts := plan.Options{GuestTimeout: guestFallback, UPSDeadline: f.upsDeadline}
 	p := plan.Build(host, roles, guests, status, opts)
 	e := &execute.Executor{Hyp: runner, UPS: ups, Ceph: runner, Kube: runner, Host: runner,
 		Deadline: deadline, DryRun: f.dryRun}
@@ -120,17 +146,12 @@ func runConserve(args []string) int {
 		return 0
 	}
 
-	w, err := journal.Open(f.runsDir, p.Host, journal.TriggerUPS)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: no journal: %v\n", err)
-	} else {
-		e.Record = w
-	}
+	w := audit.Open(p.Host, audit.TriggerUPS)
+	e.Record = w
 
 	res := e.Run(ctx, p)
-	if w != nil {
-		_ = w.Close(res.Completed, res.Aborted)
-	}
+	_ = w.Close(res.Completed, res.Aborted)
+
 	if res.Aborted {
 		fmt.Printf("conserve: stopped before acting — UPS reports %q, so there is nothing to conserve (reversed %d)\n",
 			res.Gate, res.Reversed)
@@ -140,7 +161,8 @@ func runConserve(args []string) int {
 	return 0
 }
 
-// runCancel abandons a sleep in progress and undoes what it did. Invoked from NOTIFYCMD on ONLINE.
+// runCancel abandons a sleep in progress and undoes what it did. Invoked from
+// NOTIFYCMD on ONLINE.
 //
 // It reverses what the journal says this host actually did, not everything it
 // could have done — a noout an operator set for maintenance is not ours to clear.
@@ -153,7 +175,7 @@ func runCancel(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	runs, err := journal.Load(f.runsDir)
+	runs, err := audit.LoadRuns(ctx)
 	if err != nil || len(runs) == 0 {
 		fmt.Println("cancel: no run to undo")
 		return 0
@@ -166,21 +188,17 @@ func runCancel(args []string) int {
 }
 
 // runSleep performs the whole sequence. Invoked from upsmon's SHUTDOWNCMD, and
-// from systemd on a normal reboot.
-//
-// Ungated on purpose. SHUTDOWNCMD is terminal in NUT — the decision is already
-// made — and a normal reboot reads OL, which a gate would treat as "mains are
-// back" and abandon, leaving guests running while the host stops underneath them.
+// from systemd on a normal shutdown or reboot.
 func runSleep(args []string) int {
 	fs := flag.NewFlagSet("sleep", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
-	trigger := fs.String("trigger", journal.TriggerUPS, "ups | systemd | manual — recorded, and kept apart in calibration")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
+	trigger := detectTrigger()
 	p, e, _ := f.build(ctx)
 
 	// Why we are stopping decides whether power returning matters.
@@ -190,19 +208,14 @@ func runSleep(args []string) int {
 	// An operator or a systemd reboot asked for this, and the UPS reporting
 	// healthy power is simply not news — gating there would abandon a shutdown
 	// that was requested, leaving guests running while the host stops under them.
-	e.NoGate = *trigger != journal.TriggerUPS
+	e.NoGate = trigger != audit.TriggerUPS
 
-	w, err := journal.Open(f.runsDir, p.Host, *trigger)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: no journal: %v\n", err)
-	} else {
-		e.Record = w
-	}
+	w := audit.Open(p.Host, trigger)
+	e.Record = w
 
 	res := e.Run(ctx, p)
-	if w != nil {
-		_ = w.Close(res.Completed, res.Aborted)
-	}
+	_ = w.Close(res.Completed, res.Aborted)
+
 	if res.Aborted {
 		fmt.Printf("sleep: abandoned — UPS reports %q, so the reason for stopping is gone; undid %d action(s)\n",
 			res.Gate, res.Reversed)
@@ -212,44 +225,12 @@ func runSleep(args []string) int {
 	return 0
 }
 
-// runReport emits run journals that have not been delivered and marks them so a
-// reboot cannot send the same incident twice.
-//
-// Emitted to stdout as one JSON object per line: whatever collects this process
-// (journald today, a shipper later) gets the record without CryoSheep needing to
-// know where the logs live.
-func runReport(args []string) int {
-	fs := flag.NewFlagSet("report", flag.ExitOnError)
-	runsDir := fs.String("runs", "/var/lib/cryosheep/runs", "where run journals are kept")
-	keep := fs.Bool("keep", false, "emit without marking as shipped")
-	_ = fs.Parse(args)
-
-	runs, err := journal.Unshipped(*runsDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "report: %v\n", err)
-		return 1
-	}
-	enc := json.NewEncoder(os.Stdout)
-	for _, r := range runs {
-		if err := enc.Encode(r); err != nil {
-			return 1
-		}
-		if !*keep {
-			if err := journal.MarkShipped(*runsDir, r.ID); err != nil {
-				fmt.Fprintf(os.Stderr, "report: could not mark %s shipped: %v\n", r.ID, err)
-			}
-		}
-	}
-	return 0
-}
-
 // runWake revives a machine after stasis.
 //
 // Stopped is never the desired state, so coming back is as much a part of this
 // as going down. On boot, wake undoes what the last sleep did — uncordons the
-// node, starts the guests it stopped, clears noout — and ships the records of
-// what happened, so the event can be reconstructed once there is somewhere to
-// send it.
+// node, starts the guests it stopped, clears noout — and says whether the stop
+// it is recovering from was orderly or a cut.
 //
 // It undoes CryoSheep's own actions and nothing else. Databases and quorum
 // services bring themselves back: they are built to, given a clean stop, and a
@@ -260,41 +241,40 @@ func runWake(args []string) int {
 	fs := flag.NewFlagSet("wake", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
-	noShip := fs.Bool("no-ship", false, "revive without emitting run journals")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	runs, err := journal.Load(f.runsDir)
+	runs, err := audit.LoadRuns(ctx)
 	if err != nil || len(runs) == 0 {
 		fmt.Println("wake: nothing to revive")
-	} else {
-		fmt.Printf("wake: reviving from run %s (%s)\n", runs[0].ID, runs[0].Trigger)
-		revived := undoRun(ctx, f, runs[0])
-		fmt.Printf("wake: undid %d action(s)\n", revived)
-	}
-	if *noShip {
 		return 0
 	}
-	return runReport([]string{"--runs", f.runsDir})
+
+	last := runs[0]
+	how := "graceful"
+	if last.WasCut() {
+		how = "cut"
+	}
+	fmt.Printf("wake: reviving from run %s (%s) — previous stop was %s\n", last.ID, last.Trigger, how)
+
+	revived := undoRun(ctx, f, last)
+	fmt.Printf("wake: undid %d action(s)\n", revived)
+	return 0
 }
 
 // undoRun reverses the actions a run recorded, newest first, and only those it
 // actually completed — a noout or a cordon an operator set by hand is not ours
 // to clear.
-func undoRun(ctx context.Context, f runFlags, run journal.Run) int {
+func undoRun(ctx context.Context, f runFlags, run audit.Run) int {
 	runner := exec.New()
-	var ups *nut.Client
-	if f.upsAddr != "" {
-		ups = nut.New(f.upsAddr, f.upsName)
-		ups.User, ups.Pass = f.upsUser, f.password()
-	}
+	ups, _ := upsFor()
 
 	undone := 0
 	for i := len(run.Steps) - 1; i >= 0; i-- {
 		s := run.Steps[i]
-		if s.Outcome != journal.OutcomeDone {
+		if s.Outcome != audit.OutcomeDone {
 			continue
 		}
 		var undo func() error

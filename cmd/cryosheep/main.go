@@ -16,7 +16,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/PrPlanIT/CryoSheep/src/adapters/nut"
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 	"github.com/PrPlanIT/CryoSheep/src/calibrate"
 	"github.com/PrPlanIT/CryoSheep/src/core"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
@@ -39,8 +39,6 @@ func main() {
 		os.Exit(runCancel(os.Args[2:]))
 	case "wake":
 		os.Exit(runWake(os.Args[2:]))
-	case "report":
-		os.Exit(runReport(os.Args[2:]))
 	case "calibrate":
 		os.Exit(runCalibrate(os.Args[2:]))
 	case "version", "--version", "-v":
@@ -57,10 +55,9 @@ func usage() {
   plan       show what would happen here, changing nothing
   conserve   shed load and hold, reversibly        (upsmon NOTIFYCMD, ONBATT)
   sleep      put this machine into stasis         (upsmon SHUTDOWNCMD / systemd)
-             --trigger ups abandons if mains return; manual and systemd do not
+             a UPS-triggered sleep abandons if mains return; a requested one does not
   cancel     abandon a sleep and undo it          (upsmon NOTIFYCMD, ONLINE)
-  wake       revive after stasis and ship records (on boot)
-  report     emit undelivered run journals, once
+  wake       revive after stasis                  (on boot)
   calibrate  recommend a threshold from what past runs actually cost
   version    build identity
 
@@ -80,12 +77,12 @@ func runPlan(args []string) int {
 
 	// The worst case is what has to fit, not the typical one.
 	var runtime time.Duration
-	if f.upsAddr != "" {
-		if d, err := nut.New(f.upsAddr, f.upsName).Runtime(ctx); err == nil {
+	if c, ok := upsFor(); ok {
+		if d, err := c.Runtime(ctx); err == nil {
 			runtime = d
 		}
 	}
-	render(p, runtime, f.guestTimeout)
+	render(p, runtime, guestFallback)
 	return 0
 }
 
@@ -200,18 +197,19 @@ func join(roles []core.Role) string {
 // who has seen the numbers.
 func runCalibrate(args []string) int {
 	fs := flag.NewFlagSet("calibrate", flag.ExitOnError)
-	runsDir := fs.String("runs", "/var/lib/cryosheep/runs", "directory of run journals")
 	margin := fs.Float64("margin", 0.5, "safety margin applied over the worst observed run")
 	floor := fs.Duration("floor", 120*time.Second, "never recommend below this")
-	upsAddr := fs.String("ups-addr", "", "NUT server host[:port], to check the recommendation fits")
-	upsName := fs.String("ups-name", "ups", "UPS name as upsd knows it")
 	_ = fs.Parse(args)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	host, _ := os.Hostname()
-	runs, err := calibrate.LoadRuns(*runsDir)
+	past, err := audit.LoadRuns(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not read %s: %v\n", *runsDir, err)
+		fmt.Fprintf(os.Stderr, "warning: could not read past runs: %v\n", err)
 	}
+	runs := calibrate.FromAudit(past)
 
 	sum := calibrate.Summarize(host, runs)
 	rec := calibrate.Recommend(sum, *margin, *floor)
@@ -227,10 +225,8 @@ func runCalibrate(args []string) int {
 		fmt.Printf("note:      %s\n", rec.Note)
 	}
 
-	if *upsAddr != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if s, err := nut.New(*upsAddr, *upsName).Runtime(ctx); err == nil {
+	if c, ok := upsFor(); ok {
+		if s, err := c.Runtime(ctx); err == nil {
 			ok, why := calibrate.Feasible(rec, s)
 			fmt.Printf("battery:   %s remaining now\n", s)
 			if !ok {

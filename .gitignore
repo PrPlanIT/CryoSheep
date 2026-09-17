@@ -6,3 +6,6 @@
 *token*
 
 .build/
+
+# locally built binary
+/cryosheep

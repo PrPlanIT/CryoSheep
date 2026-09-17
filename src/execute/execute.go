@@ -27,8 +27,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 	"github.com/PrPlanIT/CryoSheep/src/core"
-	"github.com/PrPlanIT/CryoSheep/src/journal"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
 	"github.com/PrPlanIT/CryoSheep/src/ups"
 )
@@ -168,14 +168,14 @@ func (e *Executor) now() time.Time {
 func (e *Executor) performAt(ctx context.Context, s plan.Step, rec Recorder, idx int) (string, error) {
 	if s.Action == plan.ActionK8sRecord {
 		if e.Kube == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		pods, err := e.Kube.StatefulPods(ctx, s.Target)
 		if err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 		rec.Note(idx, describePods(pods))
-		return journal.OutcomeDone, nil
+		return audit.OutcomeDone, nil
 	}
 	return e.perform(ctx, s)
 }
@@ -236,7 +236,7 @@ func describePods(pods []core.StatefulPod) string {
 	var b strings.Builder
 	for i, p := range ordered {
 		l := line(p)
-		if b.Len()+len(l)+1 > journal.MaxNote-reserve {
+		if b.Len()+len(l)+1 > audit.MaxNote-reserve {
 			fmt.Fprintf(&b, "\n+%d more not recorded", len(ordered)-i)
 			break
 		}
@@ -250,55 +250,55 @@ func describePods(pods []core.StatefulPod) string {
 
 func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 	if e.DryRun {
-		return journal.OutcomeSkipped, nil
+		return audit.OutcomeSkipped, nil
 	}
 	switch s.Action {
 	case plan.ActionUPSDeadline:
 		if e.Deadline == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if err := e.Deadline.Arm(ctx, s.Timeout); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	case plan.ActionCephNoout:
 		if e.Ceph == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if err := e.Ceph.SetNoout(ctx); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	case plan.ActionK8sCordon:
 		if e.Kube == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if err := e.Kube.Cordon(ctx, s.Target); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	case plan.ActionK8sUnmount:
 		if e.Kube == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if _, err := e.Kube.UnmountCSI(ctx); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	case plan.ActionGuestStop:
 		if e.Hyp == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if err := e.Hyp.Shutdown(ctx, s.Target, s.Timeout); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	case plan.ActionHostHalt:
 		if e.Host == nil {
-			return journal.OutcomeSkipped, nil
+			return audit.OutcomeSkipped, nil
 		}
 		if err := e.Host.Poweroff(ctx); err != nil {
-			return journal.OutcomeFailed, err
+			return audit.OutcomeFailed, err
 		}
 	default:
-		return journal.OutcomeSkipped, nil
+		return audit.OutcomeSkipped, nil
 	}
-	return journal.OutcomeDone, nil
+	return audit.OutcomeDone, nil
 }
 
 // reverse undoes completed reversible steps, newest first, and only steps this
@@ -318,9 +318,9 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 				err = e.Deadline.Cancel(ctx)
 			}
 			if err != nil {
-				rec.StepEnd(idx, journal.OutcomeFailed, err)
+				rec.StepEnd(idx, audit.OutcomeFailed, err)
 			} else {
-				rec.StepEnd(idx, journal.OutcomeDone, nil)
+				rec.StepEnd(idx, audit.OutcomeDone, nil)
 				n++
 			}
 			break
@@ -342,10 +342,10 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 				err = e.Kube.Uncordon(ctx, s.Target)
 			}
 			if err != nil {
-				rec.StepEnd(idx, journal.OutcomeFailed, err)
+				rec.StepEnd(idx, audit.OutcomeFailed, err)
 				continue
 			}
-			rec.StepEnd(idx, journal.OutcomeDone, nil)
+			rec.StepEnd(idx, audit.OutcomeDone, nil)
 			n++
 			continue
 		}
@@ -359,10 +359,10 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 				err = e.Hyp.Start(ctx, s.Target)
 			}
 			if err != nil {
-				rec.StepEnd(idx, journal.OutcomeFailed, err)
+				rec.StepEnd(idx, audit.OutcomeFailed, err)
 				continue
 			}
-			rec.StepEnd(idx, journal.OutcomeDone, nil)
+			rec.StepEnd(idx, audit.OutcomeDone, nil)
 			n++
 			continue
 		}
@@ -376,10 +376,10 @@ func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, 
 			err = undo(ctx)
 		}
 		if err != nil {
-			rec.StepEnd(idx, journal.OutcomeFailed, err)
+			rec.StepEnd(idx, audit.OutcomeFailed, err)
 			continue
 		}
-		rec.StepEnd(idx, journal.OutcomeDone, nil)
+		rec.StepEnd(idx, audit.OutcomeDone, nil)
 		n++
 	}
 	return n
