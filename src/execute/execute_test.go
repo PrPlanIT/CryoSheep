@@ -447,3 +447,15 @@ func TestDescribePodsReportsNoOmissionWhenAllFit(t *testing.T) {
 		t.Fatalf("claimed an omission that did not happen: %q", got)
 	}
 }
+
+// A DaemonSet pod labelled role=worker speaks the same vocabulary as a database
+// replica without being a quorum member; it must not lead the record.
+func TestDescribePodsRanksStatefulRoleAboveLooseLabels(t *testing.T) {
+	pods := []core.StatefulPod{
+		{Namespace: "x", Name: "nfd-worker-abc", Role: "role=worker"},
+		{Namespace: "y", Name: "pg-1", Owner: "Cluster/pg", Role: "cnpg.io/instanceRole=replica"},
+	}
+	if first := strings.Split(describePods(pods), "\n")[0]; !strings.Contains(first, "pg-1") {
+		t.Fatalf("loose label outranked a real quorum member: %q", first)
+	}
+}

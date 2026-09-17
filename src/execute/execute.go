@@ -196,10 +196,23 @@ func describePods(pods []core.StatefulPod) string {
 		return "no stateful workloads on this node"
 	}
 
+	// A quorum member is a stateful workload that claims a role. A DaemonSet pod
+	// labelled role=worker matches the same vocabulary and is not one, so being
+	// stateful ranks ahead of merely carrying the word.
+	rank := func(p core.StatefulPod) int {
+		switch {
+		case p.Owner != "" && p.Role != "":
+			return 0
+		case p.Owner != "":
+			return 1
+		default:
+			return 2
+		}
+	}
 	ordered := make([]core.StatefulPod, len(pods))
 	copy(ordered, pods)
 	sort.SliceStable(ordered, func(i, j int) bool {
-		return ordered[i].Role != "" && ordered[j].Role == ""
+		return rank(ordered[i]) < rank(ordered[j])
 	})
 
 	line := func(p core.StatefulPod) string {
