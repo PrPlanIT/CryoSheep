@@ -186,7 +186,7 @@ func isNumeric(s string) bool {
 func (r *Runner) Shutdown(ctx context.Context, id string, timeout time.Duration) error {
 	secs := int(timeout.Seconds())
 	if secs <= 0 {
-		secs = 90
+		secs = int(core.DefaultGuestTimeout.Seconds())
 	}
 	_, err := r.Run(ctx, "qm", "shutdown", id,
 		"--timeout", fmt.Sprint(secs),

@@ -32,6 +32,20 @@ var RoleUnits = map[Role]string{
 // OrderUnset marks a guest with no Proxmox startup order.
 const OrderUnset = -1
 
+// DefaultGuestTimeout is how long a guest gets to stop when it declares no
+// budget of its own.
+//
+// It matches Proxmox's own default on purpose. CryoSheep passes an explicit
+// timeout on every shutdown, so this replaces the platform's value rather than
+// adding to it: anything lower would mean installing the tool quietly made an
+// undeclared guest less patient than it was before. A guest that needs longer
+// says so with `startup: down=`, which is where a per-guest budget belongs.
+//
+// Defined once because it was not: three copies had drifted to 90s, below the
+// platform default, and a number duplicated is a number that disagrees with
+// itself eventually.
+const DefaultGuestTimeout = 180 * time.Second
+
 // Guest is a virtual machine on this host.
 type Guest struct {
 	ID     string

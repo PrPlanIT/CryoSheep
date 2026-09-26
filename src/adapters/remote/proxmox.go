@@ -107,7 +107,7 @@ func (p *Proxmox) Shutdown(ctx context.Context, id string, timeout time.Duration
 	}
 	secs := int(timeout.Seconds())
 	if secs <= 0 {
-		secs = 90
+		secs = int(core.DefaultGuestTimeout.Seconds())
 	}
 	return p.Client.do(ctx, http.MethodPost,
 		"/api2/json/nodes/"+p.Node+"/"+kind+"/"+id+"/status/shutdown",

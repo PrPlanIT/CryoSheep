@@ -98,8 +98,8 @@ func TestEverythingReversibleReportsLength(t *testing.T) {
 func TestGuestTimeoutDefaultsAndOverrides(t *testing.T) {
 	guests := []core.Guest{{ID: "102", Status: "running"}}
 	p := Build("h", nil, guests, core.StatusOnBattery, Options{})
-	if p.Steps[0].Timeout != 90*time.Second {
-		t.Fatalf("default guest timeout = %v, want 90s", p.Steps[0].Timeout)
+	if p.Steps[0].Timeout != core.DefaultGuestTimeout {
+		t.Fatalf("default guest timeout = %v, want %v", p.Steps[0].Timeout, core.DefaultGuestTimeout)
 	}
 	p = Build("h", nil, guests, core.StatusOnBattery, Options{GuestTimeout: 30 * time.Second})
 	if p.Steps[0].Timeout != 30*time.Second {
@@ -465,5 +465,17 @@ func TestPointOfNoReturnIsUnaffectedByConcurrency(t *testing.T) {
 		if got, want := p.PointOfNoReturn(), len(p.Steps)-1; got != want {
 			t.Fatalf("concurrency %d: point of no return %d, want %d (the halt)", c, got, want)
 		}
+	}
+}
+
+// The fallback must never be shorter than the platform's own default. Anything
+// lower means installing CryoSheep quietly makes an undeclared guest less
+// patient than it was before -- which is how a guest measured at 185s came to be
+// killed at 90, while the hypervisor was blamed for a default it never had.
+func TestDefaultGuestTimeoutIsNotShorterThanProxmoxOwnDefault(t *testing.T) {
+	const proxmoxDefault = 180 * time.Second
+	if core.DefaultGuestTimeout < proxmoxDefault {
+		t.Fatalf("DefaultGuestTimeout = %v, must not be below Proxmox's own %v",
+			core.DefaultGuestTimeout, proxmoxDefault)
 	}
 }

@@ -116,7 +116,7 @@ const AllAtOnce = -1
 
 func (o Options) withDefaults() Options {
 	if o.GuestTimeout <= 0 {
-		o.GuestTimeout = 90 * time.Second
+		o.GuestTimeout = core.DefaultGuestTimeout
 	}
 	if o.GuestConcurrency == 0 {
 		o.GuestConcurrency = 1

@@ -22,7 +22,14 @@ import (
 // guestFallback bounds a guest's ACPI shutdown when Proxmox has no `down=` for
 // it. Not configurable: Proxmox is already where a per-guest budget belongs, and
 // a flag here would only be a worse copy of a field that already exists.
-const guestFallback = 90 * time.Second
+//
+// It matches Proxmox's own default deliberately. CryoSheep passes --timeout on
+// every qm shutdown, so this value replaces the platform's rather than adding to
+// it — and a fallback below the default is a silent downgrade: installing the
+// tool would make an undeclared guest less patient than it was before, which is
+// the opposite of the point. Raise a specific guest with `startup: down=`, which
+// is the field this reads and the one place a per-guest budget belongs.
+const guestFallback = core.DefaultGuestTimeout
 
 // runFlags is the whole configurable surface.
 //
