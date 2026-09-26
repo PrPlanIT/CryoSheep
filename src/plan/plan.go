@@ -46,6 +46,19 @@ type Step struct {
 	// is not reversible has run, the gates stop — the host is committed and
 	// re-checking would only add a way to hang.
 	Reversible bool
+
+	// Wave groups steps that may run at once. A wave is issued together and
+	// awaited as a set; waves run in ascending order. Every step has a wave, and
+	// a wave of one is the serial case, so a plan that shares no waves behaves
+	// exactly as it did before waves existed.
+	//
+	// Waves exist because the right concurrency differs by flow rather than by
+	// action. Stopping an estate wants every guest at once, because nothing is
+	// staying up and the budget is a battery. Rolling maintenance wants one at a
+	// time, because the point is that the cluster keeps serving. Same steps,
+	// opposite policy — so the policy belongs in the plan, not in the executor
+	// and not in a second code path.
+	Wave int
 }
 
 type Options struct {
@@ -57,6 +70,35 @@ type Options struct {
 	// host with no authority over the UPS.
 	UPSDeadline time.Duration
 
+	// GuestConcurrency is how many guests may be stopping at once.
+	//
+	// 1 stops them one at a time. n stops n. AllAtOnce stops every guest in a
+	// tier together, which is what a power failure wants: serial does not fit a
+	// battery, and a serial queue also means one hung guest starves the ones
+	// behind it.
+	//
+	// Unset means serial, deliberately. Concurrency is opted into, because it
+	// coarsens when a sequence can be abandoned: guests issued together cannot be
+	// abandoned between, so mains returning mid-wave stops all of them and then
+	// restarts all of them. Serial keeps that granularity and is what every
+	// caller got before this existed.
+	//
+	// Guests that declare an order are never merged across tiers whatever this
+	// says. An order is a statement about what must stop before what, and
+	// parallelism is not licence to ignore it.
+	GuestConcurrency int
+
+	// HoldUntil delays the first committing step until this long after the
+	// sequence began, so several hosts acting on one signal halt together rather
+	// than as each finishes.
+	//
+	// It exists for shared storage. With OSDs on the machines being stopped, a
+	// host that halts the moment it is ready takes its OSDs while another host's
+	// guests are still writing, and below min_size the stragglers freeze
+	// mid-sync. Waiting costs battery; not waiting costs the slowest guests,
+	// which are the databases.
+	HoldUntil time.Duration
+
 	// OmitHalt leaves the final poweroff out, because something else is already
 	// stopping this machine.
 	//
@@ -67,17 +109,31 @@ type Options struct {
 	OmitHalt bool
 }
 
+// AllAtOnce stops every guest in an order tier together. Negative rather than
+// zero so that the zero value stays serial and nobody inherits concurrency by
+// forgetting to ask for it.
+const AllAtOnce = -1
+
 func (o Options) withDefaults() Options {
 	if o.GuestTimeout <= 0 {
 		o.GuestTimeout = 90 * time.Second
+	}
+	if o.GuestConcurrency == 0 {
+		o.GuestConcurrency = 1
 	}
 	return o
 }
 
 type Plan struct {
-	Host      string
-	Roles     []core.Role
-	Guests    []core.Guest
+	Host   string
+	Roles  []core.Role
+	Guests []core.Guest
+
+	// HoldUntil is how long after the sequence began the first committing step
+	// may run. It lives on the plan rather than on the executor because it is
+	// part of what was decided, not part of how it is carried out — and because
+	// a plan that can be read before it runs should say that it will wait.
+	HoldUntil time.Duration
 	UPSStatus string
 	Steps     []Step
 }
@@ -114,6 +170,49 @@ func shutdownOrder(guests []core.Guest) []core.Guest {
 	return running
 }
 
+// guestWaves splits guests, already in shutdown order, into the groups that may
+// run concurrently.
+//
+// A tier is a run of guests sharing an Order. Tiers never merge: an order says
+// this stops before that, and the whole point of honouring it is that it is not
+// negotiable for speed. Within a tier, concurrency decides how finely it is cut
+// — 1 for one at a time, 0 for the whole tier at once, n for a bounded roll.
+func guestWaves(ordered []core.Guest, concurrency int) [][]core.Guest {
+	var out [][]core.Guest
+	for i := 0; i < len(ordered); {
+		j := i
+		for j < len(ordered) && sameTier(ordered[i], ordered[j]) {
+			j++
+		}
+		tier := ordered[i:j]
+		switch {
+		case concurrency < 0:
+			out = append(out, tier)
+		default:
+			for k := 0; k < len(tier); k += concurrency {
+				end := k + concurrency
+				if end > len(tier) {
+					end = len(tier)
+				}
+				out = append(out, tier[k:end])
+			}
+		}
+		i = j
+	}
+	return out
+}
+
+// sameTier reports whether two guests may stop together. Unordered guests are
+// one tier; ordered guests share a tier only with the same Order.
+func sameTier(a, b core.Guest) bool {
+	au := a.Order == core.OrderUnset || a.Order == 0
+	bu := b.Order == core.OrderUnset || b.Order == 0
+	if au || bu {
+		return au && bu
+	}
+	return a.Order == b.Order
+}
+
 // PointOfNoReturn is the index of the first step that cannot be reversed, or
 // len(Steps) when every step can. Steps before it are gated on UPS state.
 func (p Plan) PointOfNoReturn() int {
@@ -133,7 +232,14 @@ func (p Plan) PointOfNoReturn() int {
 func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string, opts Options) Plan {
 	opts = opts.withDefaults()
 
-	p := Plan{Host: host, Roles: roles, Guests: guests, UPSStatus: upsStatus}
+	p := Plan{Host: host, Roles: roles, Guests: guests, UPSStatus: upsStatus, HoldUntil: opts.HoldUntil}
+
+	// Waves are handed out as steps are appended. Everything that is not a guest
+	// takes a wave of its own: these are host-wide and ordered against each
+	// other, and running two of them at once would only invent a race.
+	wave := 0
+	solo := func() int { wave++; return wave }
+
 	has := func(r core.Role) bool {
 		for _, x := range roles {
 			if x == r {
@@ -152,6 +258,7 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 			Detail:     "UPS cuts power regardless of what follows",
 			Timeout:    opts.UPSDeadline,
 			Reversible: true,
+			Wave:       solo(),
 		})
 	}
 
@@ -163,6 +270,7 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 			Action:     ActionCephNoout,
 			Detail:     "stop rebalance for a planned outage",
 			Reversible: true,
+			Wave:       solo(),
 		})
 	}
 
@@ -185,37 +293,41 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 	if has(core.RoleKubelet) {
 		p.Steps = append(p.Steps,
 			Step{Action: ActionK8sRecord, Target: host,
-				Detail: "note which workloads held authority here", Reversible: true},
+				Detail: "note which workloads held authority here", Reversible: true, Wave: solo()},
 			Step{Action: ActionK8sCordon, Target: host,
-				Detail: "stop scheduling onto a node that is leaving", Reversible: true},
+				Detail: "stop scheduling onto a node that is leaving", Reversible: true, Wave: solo()},
 			Step{Action: ActionK8sUnmount,
-				Detail: "release Ceph/CSI mounts before the network goes"},
+				Detail: "release Ceph/CSI mounts before the network goes", Wave: solo()},
 		)
 	}
 
-	for _, g := range shutdownOrder(guests) {
-		// A guest that declares its own budget gets it. Proxmox already knows a
-		// firewall needs longer than a scratch VM; a flat timeout would make the
-		// whole sequence as slow as its most patient member.
-		budget := opts.GuestTimeout
-		if g.Down > 0 {
-			budget = g.Down
+	for _, group := range guestWaves(shutdownOrder(guests), opts.GuestConcurrency) {
+		w := solo()
+		for _, g := range group {
+			// A guest that declares its own budget gets it. Proxmox already knows a
+			// firewall needs longer than a scratch VM; a flat timeout would make the
+			// whole sequence as slow as its most patient member.
+			budget := opts.GuestTimeout
+			if g.Down > 0 {
+				budget = g.Down
+			}
+			p.Steps = append(p.Steps, Step{
+				Action:  ActionGuestStop,
+				Target:  g.ID,
+				Detail:  g.Name,
+				Timeout: budget,
+				Wave:    w,
+				// Undoable: the guest can be started again. Gating every guest is
+				// what stops a recovered outage from becoming a real one — power
+				// back while the third of six is stopping must abandon the
+				// sequence, not complete it.
+				Reversible: true,
+			})
 		}
-		p.Steps = append(p.Steps, Step{
-			Action:  ActionGuestStop,
-			Target:  g.ID,
-			Detail:  g.Name,
-			Timeout: budget,
-			// Undoable: the guest can be started again. Gating every guest is
-			// what stops a recovered outage from becoming a real one — power
-			// back while the third of six is stopping must abandon the
-			// sequence, not complete it.
-			Reversible: true,
-		})
 	}
 
 	if !opts.OmitHalt {
-		p.Steps = append(p.Steps, Step{Action: ActionHostHalt, Detail: host})
+		p.Steps = append(p.Steps, Step{Action: ActionHostHalt, Detail: host, Wave: solo()})
 	}
 	return p
 }

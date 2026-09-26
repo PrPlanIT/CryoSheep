@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/audit"
@@ -71,6 +72,10 @@ type Executor struct {
 	// GateTimeout bounds a UPS read. A gate that cannot answer promptly is as
 	// useless as one that answers wrongly, and this runs against a battery.
 	GateTimeout time.Duration
+
+	// After is swappable so the barrier can be tested without spending the time
+	// it exists to spend.
+	After func(time.Duration) <-chan time.Time
 }
 
 type Result struct {
@@ -82,6 +87,10 @@ type Result struct {
 	// Gate is the UPS status that caused an abort, so a caller can say why
 	// rather than only that.
 	Gate string
+
+	// Held is how long the sequence waited at the barrier before committing, so
+	// a run can be calibrated against what the wait actually cost.
+	Held time.Duration
 }
 
 func (e *Executor) recorder() Recorder {
@@ -100,9 +109,18 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 	var reversible []plan.Step // completed and undoable, for LIFO reversal
 	var model ups.Model        // readings accumulate, so a trend is available
 
-	for i, step := range p.Steps {
+	started := e.now()
+	held := false
+
+	for _, wave := range waveIndices(p.Steps) {
+		first := wave[0]
+
+		// Gated once per wave rather than once per step. A wave is issued as a
+		// set, so there is no moment between its members at which abandoning it
+		// would be coherent: half a wave stopped is not a state the reversal
+		// path describes.
 		gate := ""
-		if !e.NoGate && i <= pnr {
+		if !e.NoGate && first <= pnr {
 			status, back := e.mainsBack(ctx, &model)
 			gate = status
 			if back {
@@ -113,18 +131,159 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 			}
 		}
 
-		idx := rec.StepStart(string(step.Action), step.Target, gate)
-		outcome, err := e.performAt(ctx, step, rec, idx)
-		rec.StepEnd(idx, outcome, err)
-		res.Ran++
+		// The barrier. Held before the first step that cannot be undone, so
+		// several hosts acting on one signal commit together rather than as each
+		// becomes ready. Waiting costs battery; not waiting costs whichever host
+		// was still writing to storage the early finishers took away.
+		if !held && p.HoldUntil > 0 && first >= pnr {
+			res.Held = e.hold(ctx, started, p.HoldUntil)
+			held = true
+		}
 
-		if err == nil && step.Reversible {
-			reversible = append(reversible, step)
+		for _, r := range e.runWave(ctx, p.Steps, wave, rec, gate) {
+			res.Ran++
+			if r.err == nil && p.Steps[r.i].Reversible {
+				reversible = append(reversible, p.Steps[r.i])
+			}
 		}
 	}
 
 	res.Completed = true
 	return res
+}
+
+// waveIndices groups consecutive steps sharing a wave.
+//
+// Consecutive because a plan lists its steps in order and waves ascend; a wave
+// that appeared twice with something between would mean the plan had already
+// contradicted itself, and running it as two groups is the honest reading.
+func waveIndices(steps []plan.Step) [][]int {
+	var out [][]int
+	for i := 0; i < len(steps); {
+		j := i + 1
+		for j < len(steps) && steps[j].Wave == steps[i].Wave {
+			j++
+		}
+		g := make([]int, 0, j-i)
+		for k := i; k < j; k++ {
+			g = append(g, k)
+		}
+		out = append(out, g)
+		i = j
+	}
+	return out
+}
+
+// hold waits until d has elapsed since the sequence began, and reports how long
+// it actually waited so the run can be calibrated.
+func (e *Executor) hold(ctx context.Context, started time.Time, d time.Duration) time.Duration {
+	wait := d - e.now().Sub(started)
+	if wait <= 0 {
+		return 0
+	}
+	after := e.After
+	if after == nil {
+		after = time.After
+	}
+	select {
+	case <-ctx.Done():
+	case <-after(wait):
+	}
+	return wait
+}
+
+type waveResult struct {
+	i       int
+	outcome string
+	err     error
+}
+
+// runWave issues a wave and waits for all of it.
+//
+// A wave of one is performed inline, so the overwhelmingly common case keeps
+// exactly the behaviour it had before waves existed — same call order, same
+// recorder sequence, nothing to go wrong differently.
+func (e *Executor) runWave(ctx context.Context, steps []plan.Step, idxs []int, rec Recorder, gate string) []waveResult {
+	if len(idxs) == 1 {
+		i := idxs[0]
+		id := rec.StepStart(string(steps[i].Action), steps[i].Target, gate)
+		outcome, err := e.performAt(e.stepCtx(ctx, steps[i]), steps[i], rec, id)
+		rec.StepEnd(id, outcome, err)
+		return []waveResult{{i: i, outcome: outcome, err: err}}
+	}
+
+	// The journal is written from several goroutines here, so it is serialised.
+	// The alternative — a recorder that each adapter has to make safe — puts the
+	// obligation in the wrong place and would be discovered by a corrupted run.
+	safe := &lockedRecorder{inner: rec}
+
+	ids := make([]int, len(idxs))
+	for k, i := range idxs {
+		ids[k] = safe.StepStart(string(steps[i].Action), steps[i].Target, gate)
+	}
+
+	out := make([]waveResult, len(idxs))
+	var wg sync.WaitGroup
+	for k, i := range idxs {
+		wg.Add(1)
+		go func(k, i int) {
+			defer wg.Done()
+			outcome, err := e.performAt(e.stepCtx(ctx, steps[i]), steps[i], safe, ids[k])
+			out[k] = waveResult{i: i, outcome: outcome, err: err}
+		}(k, i)
+	}
+	wg.Wait()
+
+	// Ends are recorded in step order, not completion order, so the journal reads
+	// the way the plan does.
+	for k := range out {
+		safe.StepEnd(ids[k], out[k].outcome, out[k].err)
+	}
+	return out
+}
+
+// stepCtx bounds a guest shutdown by its own budget.
+//
+// This is what makes one hung guest cost only itself. Passing the timeout to the
+// adapter and hoping asks every adapter to be careful; bounding the context
+// makes it structural, so a guest that never returns cannot hold its wave-mates
+// — or, in a serial plan, everything behind it.
+//
+// Only guest stops are bounded here. ActionUPSDeadline carries the deadline to
+// arm in the same field, which is a value rather than a budget for the call.
+func (e *Executor) stepCtx(ctx context.Context, s plan.Step) context.Context {
+	if s.Action != plan.ActionGuestStop || s.Timeout <= 0 {
+		return ctx
+	}
+	c, cancel := context.WithTimeout(ctx, s.Timeout)
+	// The cancel is deliberately not deferred to the caller: the context is used
+	// only for the duration of the step, and letting it expire is the point.
+	_ = cancel
+	return c
+}
+
+// lockedRecorder serialises journal writes for a concurrent wave.
+type lockedRecorder struct {
+	mu    sync.Mutex
+	inner Recorder
+}
+
+func (l *lockedRecorder) StepStart(action, target, gate string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.StepStart(action, target, gate)
+}
+
+func (l *lockedRecorder) StepEnd(i int, outcome string, err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.inner.StepEnd(i, outcome, err)
+}
+
+func (l *lockedRecorder) Note(i int, note string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.inner.Note(i, note)
 }
 
 // mainsBack reports whether power has positively returned.

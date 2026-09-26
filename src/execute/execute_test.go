@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -457,5 +458,202 @@ func TestDescribePodsRanksStatefulRoleAboveLooseLabels(t *testing.T) {
 	}
 	if first := strings.Split(describePods(pods), "\n")[0]; !strings.Contains(first, "pg-1") {
 		t.Fatalf("loose label outranked a real quorum member: %q", first)
+	}
+}
+
+// concurrentHyp records when each guest's shutdown started and ended, and lets
+// one guest hang, so a test can tell overlap from sequence and starvation from
+// patience.
+type concurrentHyp struct {
+	mu      sync.Mutex
+	spans   map[string][2]time.Time
+	hangIDs map[string]bool
+	block   chan struct{}
+}
+
+func newConcurrentHyp(hang ...string) *concurrentHyp {
+	h := &concurrentHyp{
+		spans:   map[string][2]time.Time{},
+		hangIDs: map[string]bool{},
+		block:   make(chan struct{}),
+	}
+	for _, id := range hang {
+		h.hangIDs[id] = true
+	}
+	return h
+}
+
+func (h *concurrentHyp) Guests(context.Context) ([]core.Guest, error) { return nil, nil }
+func (h *concurrentHyp) Start(context.Context, string) error          { return nil }
+
+func (h *concurrentHyp) Shutdown(ctx context.Context, id string, _ time.Duration) error {
+	start := time.Now()
+	if h.hangIDs[id] {
+		// Hangs until the step's own context gives up, which is the behaviour a
+		// wedged guest has and the thing the executor must survive.
+		select {
+		case <-ctx.Done():
+		case <-h.block:
+		}
+	} else {
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.mu.Lock()
+	h.spans[id] = [2]time.Time{start, time.Now()}
+	h.mu.Unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (h *concurrentHyp) overlapped(a, b string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	x, okA := h.spans[a]
+	y, okB := h.spans[b]
+	if !okA || !okB {
+		return false
+	}
+	return x[0].Before(y[1]) && y[0].Before(x[1])
+}
+
+func waveOfGuests(ids []string, timeout time.Duration) plan.Plan {
+	p := plan.Plan{Host: "eggplant"}
+	for _, id := range ids {
+		p.Steps = append(p.Steps, plan.Step{
+			Action: plan.ActionGuestStop, Target: id, Timeout: timeout,
+			Reversible: true, Wave: 1,
+		})
+	}
+	p.Steps = append(p.Steps, plan.Step{Action: plan.ActionHostHalt, Wave: 2})
+	return p
+}
+
+func TestAWaveRunsItsStepsConcurrently(t *testing.T) {
+	h := newConcurrentHyp()
+	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true}
+	res := e.Run(context.Background(), waveOfGuests([]string{"1", "2", "3"}, time.Second))
+
+	if !res.Completed {
+		t.Fatal("wave did not complete")
+	}
+	if !h.overlapped("1", "2") || !h.overlapped("2", "3") {
+		t.Fatal("guests in one wave did not overlap; they ran in sequence")
+	}
+}
+
+// The property the whole design turns on: a guest that never returns costs only
+// itself. A serial queue is what made one hung guest starve everything behind
+// it, and parallelism only fixes that if the executor bounds each step.
+func TestAHangingGuestDoesNotStarveItsWaveMates(t *testing.T) {
+	h := newConcurrentHyp("2")
+	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true}
+
+	done := make(chan Result, 1)
+	go func() {
+		done <- e.Run(context.Background(), waveOfGuests([]string{"1", "2", "3"}, 150*time.Millisecond))
+	}()
+
+	select {
+	case res := <-done:
+		if !res.Completed {
+			t.Fatal("run did not complete despite the hang being bounded")
+		}
+		// The healthy guests must have finished; the hung one is bounded by its
+		// own budget rather than by anyone's patience.
+		h.mu.Lock()
+		_, ok1 := h.spans["1"]
+		_, ok3 := h.spans["3"]
+		h.mu.Unlock()
+		if !ok1 || !ok3 {
+			t.Fatal("wave-mates of a hung guest did not run")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a single hung guest starved the sequence")
+	}
+}
+
+// Concurrency must not silently drop a failure: the hung guest is still an
+// error, and the journal must say so.
+func TestAHungGuestIsRecordedAsFailedNotDone(t *testing.T) {
+	h := newConcurrentHyp("2")
+	rec := &recorder{}
+	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true, Record: rec}
+	e.Run(context.Background(), waveOfGuests([]string{"1", "2", "3"}, 100*time.Millisecond))
+
+	var failed int
+	var got []string
+	for _, st := range rec.steps {
+		got = append(got, st.outcome)
+		if st.outcome == audit.OutcomeFailed {
+			failed++
+		}
+	}
+	if failed != 1 {
+		t.Fatalf("outcomes %v, want exactly one failure (the hung guest)", got)
+	}
+}
+
+// The barrier exists so several hosts commit together. It must delay the first
+// step that cannot be undone, and only that.
+func TestHoldUntilDelaysTheFirstCommittingStep(t *testing.T) {
+	var waited time.Duration
+	now := time.Now()
+	e := &Executor{
+		Hyp: &fakeHyp{}, Host: &fakeHost{}, NoGate: true,
+		Clock: func() time.Time { return now },
+		After: func(d time.Duration) <-chan time.Time {
+			waited = d
+			ch := make(chan time.Time, 1)
+			ch <- now
+			return ch
+		},
+	}
+	p := waveOfGuests([]string{"1"}, time.Second)
+	p.HoldUntil = 240 * time.Second
+
+	res := e.Run(context.Background(), p)
+	if !res.Completed {
+		t.Fatal("run did not complete")
+	}
+	if waited != 240*time.Second {
+		t.Fatalf("waited %v, want the full barrier", waited)
+	}
+	if res.Held != 240*time.Second {
+		t.Fatalf("Held = %v, want the wait reported for calibration", res.Held)
+	}
+}
+
+func TestHoldUntilDoesNotWaitWhenTheTimeHasAlreadyPassed(t *testing.T) {
+	start := time.Now()
+	calls := 0
+	e := &Executor{
+		Hyp: &fakeHyp{}, Host: &fakeHost{}, NoGate: true,
+		Clock: func() time.Time { calls++; return start.Add(time.Duration(calls) * time.Minute) },
+		After: func(time.Duration) <-chan time.Time {
+			t.Fatal("waited despite the barrier having already elapsed")
+			return nil
+		},
+	}
+	p := waveOfGuests([]string{"1"}, time.Second)
+	p.HoldUntil = time.Second
+
+	if res := e.Run(context.Background(), p); !res.Completed {
+		t.Fatal("run did not complete")
+	}
+}
+
+// A plan with no barrier must behave exactly as it did before one existed.
+func TestNoBarrierMeansNoWait(t *testing.T) {
+	e := &Executor{
+		Hyp: &fakeHyp{}, Host: &fakeHost{}, NoGate: true,
+		After: func(time.Duration) <-chan time.Time {
+			t.Fatal("waited with no barrier set")
+			return nil
+		},
+	}
+	if res := e.Run(context.Background(), waveOfGuests([]string{"1"}, time.Second)); !res.Completed {
+		t.Fatal("run did not complete")
 	}
 }

@@ -314,3 +314,156 @@ func TestSystemdPlanStillDescribesTheWholeTeardown(t *testing.T) {
 		}
 	}
 }
+
+// waves returns the wave of every step, so a test can assert grouping without
+// caring what the numbers are — only which steps share one.
+func waves(p Plan) []int {
+	out := make([]int, 0, len(p.Steps))
+	for _, s := range p.Steps {
+		out = append(out, s.Wave)
+	}
+	return out
+}
+
+// guestGroups returns the guest targets grouped by wave, in wave order.
+func guestGroups(p Plan) [][]string {
+	var out [][]string
+	last := -1
+	for _, s := range p.Steps {
+		if s.Action != ActionGuestStop {
+			continue
+		}
+		if s.Wave != last {
+			out = append(out, nil)
+			last = s.Wave
+		}
+		out[len(out)-1] = append(out[len(out)-1], s.Target)
+	}
+	return out
+}
+
+func running(id string, order int) core.Guest {
+	return core.Guest{ID: id, Name: "vm" + id, Status: "running", Order: order}
+}
+
+func TestGuestConcurrencySerialGivesEachGuestItsOwnWave(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset), running("2", core.OrderUnset), running("3", core.OrderUnset)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: 1})
+	got := guestGroups(p)
+	if len(got) != 3 {
+		t.Fatalf("serial: got %d waves %v, want 3", len(got), got)
+	}
+}
+
+func TestGuestConcurrencyZeroStopsAnUnorderedTierAtOnce(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset), running("2", core.OrderUnset), running("3", core.OrderUnset)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: AllAtOnce})
+	got := guestGroups(p)
+	if len(got) != 1 || len(got[0]) != 3 {
+		t.Fatalf("parallel: got %v, want one wave of three", got)
+	}
+}
+
+func TestGuestConcurrencyBoundedChunksTheTier(t *testing.T) {
+	guests := []core.Guest{
+		running("1", core.OrderUnset), running("2", core.OrderUnset),
+		running("3", core.OrderUnset), running("4", core.OrderUnset), running("5", core.OrderUnset),
+	}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: 2})
+	got := guestGroups(p)
+	if len(got) != 3 {
+		t.Fatalf("bounded: got %d waves %v, want 3 (2+2+1)", len(got), got)
+	}
+	if len(got[0]) != 2 || len(got[1]) != 2 || len(got[2]) != 1 {
+		t.Fatalf("bounded: sizes %v, want 2,2,1", got)
+	}
+}
+
+// An order is a statement about what must stop before what. Parallelism is not
+// licence to ignore it, so tiers never merge however wide the concurrency is.
+func TestOrderedGuestsNeverShareAWaveAcrossTiers(t *testing.T) {
+	guests := []core.Guest{running("1", 1), running("2", 2), running("3", 3)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: AllAtOnce})
+	got := guestGroups(p)
+	if len(got) != 3 {
+		t.Fatalf("ordered: got %v, want three separate waves", got)
+	}
+	// shutdownOrder stops the highest order first.
+	if got[0][0] != "3" || got[2][0] != "1" {
+		t.Fatalf("ordered: got %v, want 3 then 2 then 1", got)
+	}
+}
+
+func TestGuestsSharingAnOrderShareAWave(t *testing.T) {
+	guests := []core.Guest{running("1", 2), running("2", 2), running("3", 1)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: AllAtOnce})
+	got := guestGroups(p)
+	if len(got) != 2 {
+		t.Fatalf("tiers: got %v, want two waves", got)
+	}
+	if len(got[0]) != 2 {
+		t.Fatalf("tiers: first wave %v, want the two order=2 guests together", got[0])
+	}
+}
+
+func TestUnorderedGuestsDoNotJoinAnOrderedTier(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset), running("2", 5)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery, Options{GuestConcurrency: AllAtOnce})
+	got := guestGroups(p)
+	if len(got) != 2 {
+		t.Fatalf("mixed: got %v, want the unordered guest in its own wave", got)
+	}
+}
+
+// Host-wide steps are ordered against each other; sharing a wave would only
+// invent a race between, say, releasing mounts and halting.
+func TestNonGuestStepsNeverShareAWave(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset)}
+	p := Build("eggplant",
+		[]core.Role{core.RoleProxmox, core.RoleCephOSD, core.RoleKubelet},
+		guests, core.StatusOnBattery,
+		Options{UPSDeadline: 5 * time.Minute, GuestConcurrency: AllAtOnce})
+
+	seen := map[int][]Action{}
+	for _, s := range p.Steps {
+		seen[s.Wave] = append(seen[s.Wave], s.Action)
+	}
+	for w, as := range seen {
+		if len(as) == 1 {
+			continue
+		}
+		for _, a := range as {
+			if a != ActionGuestStop {
+				t.Fatalf("wave %d shares %v; only guests may share a wave", w, as)
+			}
+		}
+	}
+}
+
+func TestWavesAreAscendingAndContiguousPerStep(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset), running("2", core.OrderUnset)}
+	p := Build("eggplant", []core.Role{core.RoleProxmox, core.RoleCephOSD}, guests, core.StatusOnBattery,
+		Options{GuestConcurrency: AllAtOnce})
+	got := waves(p)
+	for i := 1; i < len(got); i++ {
+		if got[i] < got[i-1] {
+			t.Fatalf("waves %v are not ascending", got)
+		}
+	}
+	if got[0] == 0 {
+		t.Fatalf("waves %v: no step should be left in wave zero", got)
+	}
+}
+
+// Concurrency must not move the commit boundary: guests stay reversible however
+// they are grouped, and the halt stays the first step that is not.
+func TestPointOfNoReturnIsUnaffectedByConcurrency(t *testing.T) {
+	guests := []core.Guest{running("1", core.OrderUnset), running("2", core.OrderUnset), running("3", core.OrderUnset)}
+	roles := []core.Role{core.RoleProxmox, core.RoleCephOSD}
+	for _, c := range []int{AllAtOnce, 1, 2} {
+		p := Build("eggplant", roles, guests, core.StatusOnBattery, Options{GuestConcurrency: c})
+		if got, want := p.PointOfNoReturn(), len(p.Steps)-1; got != want {
+			t.Fatalf("concurrency %d: point of no return %d, want %d (the halt)", c, got, want)
+		}
+	}
+}
