@@ -4,8 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/PrPlanIT/CryoSheep/src/adapters/remote"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/adapters/exec"
@@ -170,10 +172,24 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		}
 	}
 
+	// A remote target replaces the local hypervisor and the local halt, and
+	// nothing else: Ceph and kubernetes steps are about this machine, and this
+	// machine is not the one being stopped. Left nil they are planned and
+	// recorded as skipped, which is the honest account of a run that had no
+	// authority over them.
+	var hyp core.Hypervisor = runner
+	var halt core.Host = runner
+	if px, name, ok := remoteTarget(); ok {
+		hyp, halt = px, px
+		host = name
+		roles = []core.Role{core.RoleProxmox}
+		runner.Kubeconfig = ""
+	}
+
 	var guests []core.Guest
 	for _, r := range roles {
 		if r == core.RoleProxmox {
-			g, err := runner.Guests(ctx)
+			g, err := hyp.Guests(ctx)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "warning: could not list guests: %v\n", err)
 			}
@@ -209,9 +225,41 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		OmitHalt: f.trigger == audit.TriggerSystemd,
 	}
 	p := plan.Build(host, roles, guests, status, opts)
-	e := &execute.Executor{Hyp: runner, UPS: ups, Ceph: runner, Kube: runner, Host: runner,
+	e := &execute.Executor{Hyp: hyp, UPS: ups, Ceph: runner, Kube: runner, Host: halt,
 		Deadline: deadline, DryRun: f.dryRun}
+	if _, _, remote := remoteTarget(); remote {
+		// Nothing local is being stopped, so the collaborators that act on this
+		// machine are dropped rather than left pointing at it.
+		e.Ceph, e.Kube = nil, nil
+	}
 	return p, e, runner
+}
+
+// remoteTarget builds a hypervisor for a machine CryoSheep is not running on.
+//
+// Environment rather than flags for the same reason the UPS deadline is: it is
+// per-host configuration that belongs in a unit file ansible manages, not an
+// argument repeated at every call site. All four must be present — a partial
+// configuration is a mistake, and falling back to the local machine silently
+// would stop the wrong thing.
+func remoteTarget() (*remote.Proxmox, string, bool) {
+	base := os.Getenv("CRYOSHEEP_PROXMOX_URL")
+	id := os.Getenv("CRYOSHEEP_PROXMOX_TOKEN_ID")
+	secret := os.Getenv("CRYOSHEEP_PROXMOX_TOKEN_SECRET")
+	node := os.Getenv("CRYOSHEEP_PROXMOX_NODE")
+	if base == "" || id == "" || secret == "" || node == "" {
+		if base != "" || id != "" || secret != "" || node != "" {
+			fmt.Fprintln(os.Stderr,
+				"warning: CRYOSHEEP_PROXMOX_* is incomplete — all of URL, TOKEN_ID, "+
+					"TOKEN_SECRET and NODE are needed; acting on the local machine instead")
+		}
+		return nil, "", false
+	}
+	return &remote.Proxmox{
+		Client: &remote.Client{Base: strings.TrimRight(base, "/"),
+			Auth: remote.TokenAuth{TokenID: id, Secret: secret}},
+		Node: node,
+	}, node, true
 }
 
 // runConserve performs only the reversible prefix — what can be given back if

@@ -94,6 +94,28 @@ host whose storage is its own.
 `cryosheep plan` prints both — steps that will run together are marked, and a
 plan that will wait says so — so the policy can be read before it is trusted.
 
+## Stopping a machine CryoSheep does not run on
+
+Running on the host is preferable and needs no credential at all: `qm` and
+`systemctl` are simply there. Use this only for what cannot take an agent — an
+appliance, a NAS, a hypervisor you do not control.
+
+```ini
+Environment=CRYOSHEEP_PROXMOX_URL=https://eggplant.example:8006
+Environment=CRYOSHEEP_PROXMOX_TOKEN_ID=cryosheep@pve!shutdown
+Environment=CRYOSHEEP_PROXMOX_TOKEN_SECRET=...
+Environment=CRYOSHEEP_PROXMOX_NODE=eggplant
+```
+
+Give the token `Sys.PowerMgmt` and nothing else. It can then stop guests and halt
+the node, and can do nothing at all besides — which is the entire reason to
+prefer it over an SSH key that could do anything, on every host, forever.
+
+All four are required. A partial configuration warns and acts on the local
+machine rather than guessing, because stopping the wrong host is worse than
+stopping none. When a remote target is set, the Ceph and kubernetes steps are
+dropped: they act on this machine, and this machine is not the one being stopped.
+
 ## Wiring upsmon
 
 Power events reach CryoSheep through NUT, on the hosts that can read the UPS:
