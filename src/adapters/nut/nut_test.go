@@ -5,6 +5,7 @@ import (
 	"context"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -117,14 +118,35 @@ func TestNewDefaultsPort(t *testing.T) {
 
 // fakeUpsd speaks just enough of the protocol to verify the exchange, and
 // records what it was told.
-func fakeUpsd(t *testing.T, replies map[string]string) (addr string, got *[]string) {
+// recorded is the lines the fake upsd saw. It is behind a mutex because the
+// server runs on its own goroutine and the test reads it from another: without
+// this the race detector fails the test that covers arming the UPS deadline,
+// which is the backstop the whole shutdown design leans on.
+type recorded struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *recorded) add(l string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, l)
+}
+
+func (r *recorded) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.lines...)
+}
+
+func fakeUpsd(t *testing.T, replies map[string]string) (addr string, got *recorded) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	lines := &[]string{}
+	lines := &recorded{}
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -138,7 +160,7 @@ func fakeUpsd(t *testing.T, replies map[string]string) (addr string, got *[]stri
 				return
 			}
 			line = strings.TrimSpace(line)
-			*lines = append(*lines, line)
+			lines.add(line)
 			if line == "LOGOUT" {
 				return
 			}
@@ -164,12 +186,12 @@ func TestArmSendsLoadOffDelayWithSeconds(t *testing.T) {
 	// LOGOUT is courtesy sent after the command is already acknowledged, and its
 	// delivery races the close — the meaningful exchange is what precedes it.
 	want := []string{"USERNAME cryosheep", "PASSWORD secret", "INSTCMD ups load.off.delay 90"}
-	if len(*got) < len(want) {
-		t.Fatalf("exchange = %v, want it to begin %v", *got, want)
+	if len(got.all()) < len(want) {
+		t.Fatalf("exchange = %v, want it to begin %v", got.all(), want)
 	}
 	for i := range want {
-		if (*got)[i] != want[i] {
-			t.Fatalf("exchange = %v, want it to begin %v", *got, want)
+		if (got.all())[i] != want[i] {
+			t.Fatalf("exchange = %v, want it to begin %v", got.all(), want)
 		}
 	}
 }
@@ -182,13 +204,13 @@ func TestCancelSendsShutdownStop(t *testing.T) {
 		t.Fatal(err)
 	}
 	found := false
-	for _, l := range *got {
+	for _, l := range got.all() {
 		if l == "INSTCMD ups shutdown.stop" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("exchange = %v, want an INSTCMD shutdown.stop", *got)
+		t.Fatalf("exchange = %v, want an INSTCMD shutdown.stop", got.all())
 	}
 }
 
