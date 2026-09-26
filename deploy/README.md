@@ -69,6 +69,31 @@ cuts power mid-flush and produces exactly the unclean stop everything else exist
 to prevent; too long and the battery is flat before it fires. Unset means no
 hardware backstop, which is the safe default until you have measured.
 
+Two more exist for a host whose guests must stop faster than one at a time:
+
+```ini
+Environment=CRYOSHEEP_GUEST_CONCURRENCY=-1
+Environment=CRYOSHEEP_HOLD_UNTIL=4m
+```
+
+`GUEST_CONCURRENCY` is how many guests may stop at once — `1` one at a time,
+`-1` every guest in an order tier together, `n` a bounded roll. Unset means one
+at a time, because concurrency coarsens when a sequence can be abandoned: guests
+issued together cannot be abandoned between them, so mains returning mid-wave
+stops all of them and then restarts all of them. Guests that declare a Proxmox
+`startup: order=` are never merged across tiers whatever this says.
+
+`HOLD_UNTIL` makes the first step that cannot be undone wait until that long
+after the run began. It is for shared storage: with Ceph OSDs on the machines
+being stopped, a host that halts the moment it is ready takes its OSDs while
+another host's guests are still writing, and below `min_size` the stragglers
+freeze mid-sync. Set it on every host to the same value and they commit together
+rather than as each finishes. Unset means halt when ready, which is right for a
+host whose storage is its own.
+
+`cryosheep plan` prints both — steps that will run together are marked, and a
+plan that will wait says so — so the policy can be read before it is trusted.
+
 ## Wiring upsmon
 
 Power events reach CryoSheep through NUT, on the hosts that can read the UPS:

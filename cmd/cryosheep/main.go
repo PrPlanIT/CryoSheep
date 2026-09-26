@@ -110,6 +110,14 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 	}
 	fmt.Println("plan:")
 	pnr := p.PointOfNoReturn()
+
+	// Steps sharing a wave are marked, because otherwise the difference between
+	// stopping six guests one after another and stopping six at once is invisible
+	// here — and reading the plan before trusting it is the whole point of it.
+	shared := map[int]int{}
+	for _, s := range p.Steps {
+		shared[s.Wave]++
+	}
 	for i, s := range p.Steps {
 		mark := "reversible"
 		if i >= pnr {
@@ -119,13 +127,24 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 		if s.Timeout > 0 {
 			t = fmt.Sprintf(" (≤%s)", s.Timeout)
 		}
+		together := ""
+		if shared[s.Wave] > 1 {
+			together = fmt.Sprintf("  ‖ with %d others", shared[s.Wave]-1)
+		}
 		target := s.Target
 		if target == "" {
 			target = s.Detail
 		} else if s.Detail != "" {
 			target = fmt.Sprintf("%s %s", s.Target, s.Detail)
 		}
-		fmt.Printf("  %d. %-18s %-28s%s  [%s]\n", i+1, s.Action, target, t, mark)
+		fmt.Printf("  %d. %-18s %-28s%s  [%s]%s\n", i+1, s.Action, target, t, mark, together)
+	}
+
+	// A plan that will wait should say so before it is trusted: a barrier is the
+	// difference between halting when ready and halting when everyone is.
+	if p.HoldUntil > 0 {
+		fmt.Printf("\nbarrier: the first committing step waits until %s from the start,\n"+
+			"         so hosts acting on one signal stop together rather than as each finishes\n", p.HoldUntil)
 	}
 	if pnr < len(p.Steps) {
 		fmt.Printf("\npoint of no return: step %d — power returning before it aborts and reverses\n", pnr+1)

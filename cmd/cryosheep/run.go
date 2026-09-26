@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/adapters/exec"
@@ -30,6 +31,13 @@ const guestFallback = 90 * time.Second
 type runFlags struct {
 	dryRun      bool
 	upsDeadline time.Duration
+
+	// guestConcurrency is how many of a host's guests may stop at once, and
+	// holdUntil is how long to wait before the first step that cannot be undone.
+	// Both are per-host policy rather than per-invocation choices, so both read
+	// an environment default the unit file can carry.
+	guestConcurrency int
+	holdUntil        time.Duration
 
 	// kubeconfig names the identity kubectl should use. See resolveKubeconfig.
 	kubeconfig string
@@ -73,6 +81,26 @@ func (f *runFlags) bind(fs *flag.FlagSet) {
 		"when the UPS cuts power regardless of the sequence; 0 disables")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
 		"identity for kubectl; defaults to $CRYOSHEEP_KUBECONFIG, $KUBECONFIG, then "+kubeletConf)
+	fs.IntVar(&f.guestConcurrency, "guest-concurrency", envInt("CRYOSHEEP_GUEST_CONCURRENCY"),
+		"how many guests may stop at once; 1 one at a time, -1 all of a tier together, 0 takes the default (1)")
+	fs.DurationVar(&f.holdUntil, "hold-until", envDuration("CRYOSHEEP_HOLD_UNTIL"),
+		"wait this long from the start before the first step that cannot be undone, so hosts commit together; 0 disables")
+}
+
+// envInt reads a per-host policy number from the unit file, the same way
+// envDuration does, so a value that belongs to a machine is set once where
+// ansible manages it rather than repeated at every call site.
+func envInt(key string) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %s=%q is not a number, ignoring\n", key, v)
+		return 0
+	}
+	return n
 }
 
 // envDuration lets the one policy number be set per host in the unit file, where
@@ -171,8 +199,10 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	}
 
 	opts := plan.Options{
-		GuestTimeout: guestFallback,
-		UPSDeadline:  f.upsDeadline,
+		GuestTimeout:     guestFallback,
+		UPSDeadline:      f.upsDeadline,
+		GuestConcurrency: f.guestConcurrency,
+		HoldUntil:        f.holdUntil,
 		// systemd invoked us from a unit it is already stopping, so the poweroff
 		// or reboot is in flight. Halting on top of that turns a reboot into a
 		// poweroff — a node patched by ansible would never come back.
