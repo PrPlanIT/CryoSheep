@@ -39,6 +39,26 @@ ExecStop=/usr/local/bin/cryosheep sleep
 # partway through.
 Environment=CRYOSHEEP_GUEST_CONCURRENCY=-1
 
+# Startup-order ranges that stop together, in the sequence given.
+#
+# Tiers exist for startup dependency and for planned maintenance, where stopping
+# one thing at a time is exactly the point. A power failure wants the estate's
+# real dependency shape instead, which is far coarser: guest disks reach Ceph
+# over L2, but Kubernetes PVC traffic is routed through the firewall, so
+# Kubernetes is the only tier needing other tiers still standing while it drains.
+#
+#   5-99  leaves and unordered — nothing depends on them
+#   4     kubernetes — the one tier that does
+#   2-3   DNS and storage — mutually independent
+#   1     routers — alone, because anything still draining over a routed path
+#         has no other way to reach its disk
+#
+# Ranges must cover 1..99 or the whole value is discarded and every tier becomes
+# its own wave again: a guest in no range would be a guest left running.
+# Commented out until Drill B: a planned shutdown wants the careful shape, and
+# this changes what happens on every reboot, not only on battery.
+#Environment=CRYOSHEEP_ORDER_GROUPS=5-99,4,2-3,1
+
 # Inside the UPS envelope on purpose. The backstop has to fire while there is
 # still power to halt on, so it is set below the measured 461s runtime rather
 # than above it: a timeout the batteries outlive is not a backstop. 420s clears

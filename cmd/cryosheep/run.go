@@ -59,6 +59,12 @@ type runFlags struct {
 	guestConcurrency int
 	holdUntil        time.Duration
 
+	// orderGroups names spans of startup order that stop together, so a power
+	// failure can use the estate's real dependency shape rather than its finer
+	// startup tiers. Empty keeps every tier its own wave, which is what a planned
+	// shutdown of a single node wants.
+	orderGroups string
+
 	// kubeconfig names the identity kubectl should use. See resolveKubeconfig.
 	kubeconfig string
 
@@ -103,8 +109,40 @@ func (f *runFlags) bind(fs *flag.FlagSet) {
 		"identity for kubectl; defaults to $CRYOSHEEP_KUBECONFIG, $KUBECONFIG, then "+kubeletConf)
 	fs.IntVar(&f.guestConcurrency, "guest-concurrency", envInt("CRYOSHEEP_GUEST_CONCURRENCY"),
 		"how many guests may stop at once; 1 one at a time, -1 all of a tier together, 0 takes the default (1)")
+	fs.StringVar(&f.orderGroups, "order-groups", os.Getenv("CRYOSHEEP_ORDER_GROUPS"),
+		"startup-order ranges that stop together, in sequence, e.g. \"5-99,4,2-3,1\"; empty keeps every tier its own wave")
 	fs.DurationVar(&f.holdUntil, "hold-until", envDuration("CRYOSHEEP_HOLD_UNTIL"),
 		"wait this long from the start before the first step that cannot be undone, so hosts commit together; 0 disables")
+}
+
+// parseOrderGroups reads "5-99,4,2-3,1" into the ranges that stop together.
+//
+// A malformed value yields nothing rather than something partial, because a
+// partial grouping is a guest left out of the sequence. The planner discards
+// incomplete cover for the same reason, so both ends fail toward the careful
+// per-tier shape rather than away from it.
+func parseOrderGroups(spec string) []plan.OrderGroup {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil
+	}
+	var out []plan.OrderGroup
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		lo, hi, found := strings.Cut(part, "-")
+		if !found {
+			hi = lo
+		}
+		l, errL := strconv.Atoi(strings.TrimSpace(lo))
+		h, errH := strconv.Atoi(strings.TrimSpace(hi))
+		if errL != nil || errH != nil || l > h || l < 1 {
+			fmt.Fprintf(os.Stderr,
+				"warning: order-groups %q is malformed at %q, ignoring the whole value\n", spec, part)
+			return nil
+		}
+		out = append(out, plan.OrderGroup{Lo: l, Hi: h})
+	}
+	return out
 }
 
 // envInt reads a per-host policy number from the unit file, the same way
@@ -236,6 +274,7 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 		GuestTimeout:     guestFallback,
 		UPSDeadline:      f.upsDeadline,
 		GuestConcurrency: f.guestConcurrency,
+		OrderGroups:      parseOrderGroups(f.orderGroups),
 		HoldUntil:        f.holdUntil,
 		// systemd invoked us from a unit it is already stopping, so the poweroff
 		// or reboot is in flight. Halting on top of that turns a reboot into a

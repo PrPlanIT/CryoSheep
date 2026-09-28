@@ -111,3 +111,30 @@ func TestNoRemoteConfigMeansLocal(t *testing.T) {
 		t.Fatal("no configuration should mean the local machine")
 	}
 }
+
+func TestParseOrderGroups(t *testing.T) {
+	for _, tc := range []struct {
+		name, spec string
+		want       []plan.OrderGroup
+	}{
+		{"empty is no grouping", "", nil},
+		{"the emergency shape", "5-99,4,2-3,1", []plan.OrderGroup{{5, 99}, {4, 4}, {2, 3}, {1, 1}}},
+		{"single orders need no dash", "9,4,1", []plan.OrderGroup{{9, 9}, {4, 4}, {1, 1}}},
+		{"spaces are tolerated", " 5-99 , 4 ", []plan.OrderGroup{{5, 99}, {4, 4}}},
+		{"reversed range is refused whole", "5-99,9-4", nil},
+		{"non-numeric is refused whole", "5-99,four", nil},
+		{"zero is refused whole", "0-3", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseOrderGroups(tc.spec)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseOrderGroups(%q) = %v, want %v", tc.spec, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("parseOrderGroups(%q) = %v, want %v", tc.spec, got, tc.want)
+				}
+			}
+		})
+	}
+}

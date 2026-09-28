@@ -479,3 +479,127 @@ func TestDefaultGuestTimeoutIsNotShorterThanProxmoxOwnDefault(t *testing.T) {
 			core.DefaultGuestTimeout, proxmoxDefault)
 	}
 }
+
+// estate mirrors one hypervisor's share of the real cluster: a router, DNS, two
+// Kubernetes nodes, a couple of leaves and something unordered.
+func estate() []core.Guest {
+	return []core.Guest{
+		{ID: "100", Name: "pfSense", Status: "running", Order: 1},
+		{ID: "707", Name: "dns", Status: "running", Order: 2},
+		{ID: "103", Name: "nas", Status: "running", Order: 3},
+		{ID: "105", Name: "map", Status: "running", Order: 4},
+		{ID: "106", Name: "chest", Status: "running", Order: 4},
+		{ID: "869", Name: "pbx", Status: "running", Order: 5},
+		{ID: "107", Name: "moor", Status: "running", Order: 5},
+		{ID: "204", Name: "nginx", Status: "running", Order: core.OrderUnset},
+	}
+}
+
+func stopWaves(t *testing.T, o Options) [][]string {
+	t.Helper()
+	return guestGroups(Build("h", []core.Role{core.RoleProxmox}, estate(), core.StatusOnBattery, o))
+}
+
+func TestOrderGroupsCollapseRangesIntoOneWave(t *testing.T) {
+	got := stopWaves(t, Options{
+		GuestConcurrency: AllAtOnce,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+	})
+	want := [][]string{
+		{"204", "869", "107"}, // leaves and unordered, together
+		{"105", "106"},        // kubernetes alone
+		{"103", "707", "100"}, // infrastructure, together
+	}
+	if len(got) != len(want) {
+		t.Fatalf("waves = %v, want %d groups", got, len(want))
+	}
+	for i := range want {
+		if len(got[i]) != len(want[i]) {
+			t.Fatalf("wave %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestOrderGroupsKeepRangesInDeclaredOrder(t *testing.T) {
+	got := stopWaves(t, Options{
+		GuestConcurrency: AllAtOnce,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+	})
+	// The router must still be in the last wave: everything routed through it
+	// has to be gone before it goes.
+	last := got[len(got)-1]
+	var found bool
+	for _, id := range last {
+		found = found || id == "100"
+	}
+	if !found {
+		t.Fatalf("pfSense not in final wave; waves = %v", got)
+	}
+}
+
+func TestWithoutOrderGroupsEveryTierIsItsOwnWave(t *testing.T) {
+	got := stopWaves(t, Options{GuestConcurrency: AllAtOnce})
+	// unordered, 5, 4, 3, 2, 1 — the planned-shutdown shape, unchanged.
+	if len(got) != 6 {
+		t.Fatalf("waves = %v, want 6 tiers", got)
+	}
+}
+
+func TestIncompleteOrderGroupsFallBackToTiers(t *testing.T) {
+	// A range that leaves order 3 uncovered is a misconfiguration. Degrading to
+	// the careful per-tier shape is the safe direction; silently dropping a
+	// guest from the sequence is not.
+	got := stopWaves(t, Options{
+		GuestConcurrency: AllAtOnce,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 2}},
+	})
+	if len(got) != 6 {
+		t.Fatalf("waves = %v, want fallback to 6 tiers", got)
+	}
+}
+
+func TestOrderGroupsStillRespectConcurrency(t *testing.T) {
+	// Grouping says which guests may stop together; concurrency says how many
+	// actually do. A group of three at concurrency 2 is two waves, not one.
+	got := stopWaves(t, Options{
+		GuestConcurrency: 2,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+	})
+	if len(got[0]) != 2 {
+		t.Fatalf("first wave = %v, want 2 guests at concurrency 2", got[0])
+	}
+}
+
+func TestOrderGroupsDoNotDisturbTheHalt(t *testing.T) {
+	p := Build("h", []core.Role{core.RoleProxmox}, estate(), core.StatusOnBattery, Options{
+		GuestConcurrency: AllAtOnce,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+	})
+	a := actions(p)
+	if a[len(a)-1] != ActionHostHalt {
+		t.Fatalf("last action = %v, want host poweroff", a[len(a)-1])
+	}
+}
+
+func TestRoutersCanBeIsolatedInTheirOwnFinalWave(t *testing.T) {
+	// [2,3] and [1,1] rather than one [1,3]: the routers must not be stopping
+	// while DNS and storage still are. Everything else has an L2 path to its
+	// own disk, but anything still draining over a routed path does not.
+	got := stopWaves(t, Options{
+		GuestConcurrency: AllAtOnce,
+		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {2, 3}, {1, 1}},
+	})
+	if len(got) != 4 {
+		t.Fatalf("waves = %v, want 4 groups", got)
+	}
+	last := got[len(got)-1]
+	if len(last) != 1 || last[0] != "100" {
+		t.Fatalf("final wave = %v, want the router alone", last)
+	}
+	// and nothing else may share it
+	for _, id := range got[len(got)-2] {
+		if id == "100" {
+			t.Fatalf("router appears in the penultimate wave: %v", got)
+		}
+	}
+}

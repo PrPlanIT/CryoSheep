@@ -70,6 +70,16 @@ type Options struct {
 	// host with no authority over the UPS.
 	UPSDeadline time.Duration
 
+	// OrderGroups collapses spans of startup order into single waves, in the
+	// sequence declared. Empty means every tier is its own wave, which is the
+	// planned-shutdown shape and the safe default.
+	//
+	// Groups must cover every order from 1 to an unordered guest, because a
+	// guest in no group would be a guest left running. Incomplete groups are
+	// discarded rather than honoured: degrading to the careful per-tier shape
+	// is the right direction to fail in.
+	OrderGroups []OrderGroup
+
 	// GuestConcurrency is how many guests may be stopping at once.
 	//
 	// 1 stops them one at a time. n stops n. AllAtOnce stops every guest in a
@@ -114,6 +124,30 @@ type Options struct {
 // forgetting to ask for it.
 const AllAtOnce = -1
 
+// OrderGroup is an inclusive span of Proxmox startup orders whose guests stop
+// together, as one wave.
+//
+// Tiers exist for startup dependency and for planned maintenance, where stopping
+// one thing at a time is the point. A power failure wants the opposite: the
+// estate's dependencies are far coarser than its tiers, and waiting out five of
+// them in sequence spends battery on an order nothing actually needs.
+//
+// Here that is not a guess. Guest disks reach Ceph over L2 on the storage VLAN,
+// but Kubernetes PVC traffic is routed through the firewall — so Kubernetes is
+// the only tier that needs other tiers still standing while it drains. Leaves
+// above it depend on nothing; the infrastructure below it is mutually
+// independent. Three groups, not five tiers.
+type OrderGroup struct {
+	Lo, Hi int
+}
+
+// unorderedOrder is the order an unordered guest counts as when grouping.
+//
+// Proxmox starts unordered guests last and stops them first, which is precisely
+// what the highest order means, so a group reaching this covers them without a
+// special case.
+const unorderedOrder = 99
+
 func (o Options) withDefaults() Options {
 	if o.GuestTimeout <= 0 {
 		o.GuestTimeout = core.DefaultGuestTimeout
@@ -148,12 +182,20 @@ type Plan struct {
 // This is why the field is read rather than duplicated. A firewall or DNS guest
 // given order=1 boots first and survives longest, and that single value governs
 // both directions — no second list to drift out of step with it.
-func shutdownOrder(guests []core.Guest) []core.Guest {
+func shutdownOrder(guests []core.Guest, groups []OrderGroup) []core.Guest {
 	var running []core.Guest
 	for _, g := range guests {
 		if g.Running() {
 			running = append(running, g)
 		}
+	}
+	if g := usableGroups(groups); g != nil {
+		// Groups stop in the sequence they are declared in. Within one they are
+		// a single wave, so relative position inside it does not matter.
+		sort.SliceStable(running, func(i, j int) bool {
+			return groupIndexOf(running[i], g) < groupIndexOf(running[j], g)
+		})
+		return running
 	}
 	sort.SliceStable(running, func(i, j int) bool {
 		a, b := running[i], running[j]
@@ -177,11 +219,18 @@ func shutdownOrder(guests []core.Guest) []core.Guest {
 // this stops before that, and the whole point of honouring it is that it is not
 // negotiable for speed. Within a tier, concurrency decides how finely it is cut
 // — 1 for one at a time, 0 for the whole tier at once, n for a bounded roll.
-func guestWaves(ordered []core.Guest, concurrency int) [][]core.Guest {
+func guestWaves(ordered []core.Guest, concurrency int, groups []OrderGroup) [][]core.Guest {
+	groups = usableGroups(groups)
+	together := func(a, b core.Guest) bool {
+		if groups == nil {
+			return sameTier(a, b)
+		}
+		return groupIndexOf(a, groups) == groupIndexOf(b, groups)
+	}
 	var out [][]core.Guest
 	for i := 0; i < len(ordered); {
 		j := i
-		for j < len(ordered) && sameTier(ordered[i], ordered[j]) {
+		for j < len(ordered) && together(ordered[i], ordered[j]) {
 			j++
 		}
 		tier := ordered[i:j]
@@ -204,6 +253,44 @@ func guestWaves(ordered []core.Guest, concurrency int) [][]core.Guest {
 
 // sameTier reports whether two guests may stop together. Unordered guests are
 // one tier; ordered guests share a tier only with the same Order.
+// orderOf is a guest's order for grouping, with unordered folded to the top.
+func orderOf(g core.Guest) int {
+	if g.Order == core.OrderUnset || g.Order == 0 {
+		return unorderedOrder
+	}
+	return g.Order
+}
+
+// groupIndexOf returns which declared group a guest belongs to, or -1.
+func groupIndexOf(g core.Guest, groups []OrderGroup) int {
+	o := orderOf(g)
+	for i, r := range groups {
+		if o >= r.Lo && o <= r.Hi {
+			return i
+		}
+	}
+	return -1
+}
+
+// usableGroups returns the groups only if they cover every order a guest could
+// hold, and nil otherwise. A partial cover would silently leave guests out of
+// the sequence, so it is treated as no configuration at all.
+func usableGroups(groups []OrderGroup) []OrderGroup {
+	if len(groups) == 0 {
+		return nil
+	}
+	for o := 1; o <= unorderedOrder; o++ {
+		var covered bool
+		for _, r := range groups {
+			covered = covered || (o >= r.Lo && o <= r.Hi)
+		}
+		if !covered {
+			return nil
+		}
+	}
+	return groups
+}
+
 func sameTier(a, b core.Guest) bool {
 	au := a.Order == core.OrderUnset || a.Order == 0
 	bu := b.Order == core.OrderUnset || b.Order == 0
@@ -301,7 +388,7 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 		)
 	}
 
-	for _, group := range guestWaves(shutdownOrder(guests), opts.GuestConcurrency) {
+	for _, group := range guestWaves(shutdownOrder(guests, opts.OrderGroups), opts.GuestConcurrency, opts.OrderGroups) {
 		w := solo()
 		for _, g := range group {
 			// A guest that declares its own budget gets it. Proxmox already knows a
