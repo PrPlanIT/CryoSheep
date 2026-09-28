@@ -31,6 +31,17 @@ import (
 // is the field this reads and the one place a per-guest budget belongs.
 const guestFallback = core.DefaultGuestTimeout
 
+// sequenceTimeout bounds the whole run, and must stay one minute inside the
+// unit's TimeoutStopSec so this fires first and the run exits having recorded
+// why, rather than being killed mid-step with nothing written.
+//
+// Both numbers sit below the UPS runtime on purpose. It was fifteen minutes
+// against a measured 461s of battery, which is not a bound at all — the power
+// would decide the outcome long before the timeout did. The slowest host's
+// realistic sequence is 370s including host halt, so this clears it with margin
+// and still cuts losses on anything pathological while there is power to halt on.
+const sequenceTimeout = 6 * time.Minute
+
 // runFlags is the whole configurable surface.
 //
 // Everything else is either a constant, or something another system already
@@ -337,7 +348,7 @@ func runSleep(args []string) int {
 	f.bind(fs)
 	_ = fs.Parse(args)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), sequenceTimeout)
 	defer cancel()
 
 	p, e, runner := f.build(ctx)

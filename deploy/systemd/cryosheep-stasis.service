@@ -25,10 +25,27 @@ RemainAfterExit=yes
 ExecStart=/bin/true
 ExecStop=/usr/local/bin/cryosheep sleep
 
-# CryoSheep bounds its own sequence at fifteen minutes. This is the outer
-# backstop a minute later, so its own timeout fires first and it exits having
-# recorded why, rather than being killed mid-step with nothing written.
-TimeoutStopSec=16min
+# Stop every guest in an order tier at once, rather than one at a time.
+#
+# Safe by construction: guestWaves only groups guests that share a tier, and
+# guests share a tier precisely because the declared policy says neither waits on
+# the other. Tiers still run strictly in sequence, so the dependency order the
+# policy expresses is preserved exactly.
+#
+# Not optional on a UPS. The default is 1, and serial across the busiest host's
+# ten running guests takes longer than the batteries last — measured 620s on
+# Cosmos against 461s of runtime. Parallel within tier brings the same host to
+# 260s. A serial run does not shut the estate down safely; it runs out of power
+# partway through.
+Environment=CRYOSHEEP_GUEST_CONCURRENCY=-1
+
+# Inside the UPS envelope on purpose. The backstop has to fire while there is
+# still power to halt on, so it is set below the measured 461s runtime rather
+# than above it: a timeout the batteries outlive is not a backstop. 420s clears
+# the slowest host's realistic sequence (Avocado, 370s including host halt) with
+# margin, and cuts losses on anything pathological rather than waiting for the
+# power to decide.
+TimeoutStopSec=420s
 
 # The one policy number, and the only thing here worth editing per host. It is
 # the deadline after which the UPS cuts power regardless of what finished — take
