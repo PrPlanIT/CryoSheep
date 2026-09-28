@@ -118,9 +118,9 @@ func TestParseOrderGroups(t *testing.T) {
 		want       []plan.OrderGroup
 	}{
 		{"empty is no grouping", "", nil},
-		{"the emergency shape", "5-99,4,2-3,1", []plan.OrderGroup{{5, 99}, {4, 4}, {2, 3}, {1, 1}}},
-		{"single orders need no dash", "9,4,1", []plan.OrderGroup{{9, 9}, {4, 4}, {1, 1}}},
-		{"spaces are tolerated", " 5-99 , 4 ", []plan.OrderGroup{{5, 99}, {4, 4}}},
+		{"the emergency shape", "5-99,4,2-3,1", []plan.OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 2, Hi: 3}, {Lo: 1, Hi: 1}}},
+		{"single orders need no dash", "9,4,1", []plan.OrderGroup{{Lo: 9, Hi: 9}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 1}}},
+		{"spaces are tolerated", " 5-99 , 4 ", []plan.OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}}},
 		{"reversed range is refused whole", "5-99,9-4", nil},
 		{"non-numeric is refused whole", "5-99,four", nil},
 		{"zero is refused whole", "0-3", nil},
@@ -134,6 +134,37 @@ func TestParseOrderGroups(t *testing.T) {
 				if got[i] != tc.want[i] {
 					t.Fatalf("parseOrderGroups(%q) = %v, want %v", tc.spec, got, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// Whether power is the reason for stopping decides whether mains returning
+// abandons the run. It used to be inferred from the launcher's environment,
+// which cannot work: proved against NUT 2.8.3, upsmon passes NOTIFYTYPE to
+// NOTIFYCMD and nothing at all to SHUTDOWNCMD — and since upsmon itself runs
+// under systemd, its children inherit INVOCATION_ID and the sniff concluded
+// "an operator asked for this" on precisely the path where nobody did.
+func TestPowerIsTheReason(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		want         bool
+	}{
+		{"on battery", "OB", true},
+		{"on battery, low", "OB LB", true},
+		{"forced shutdown", "FSD", true},
+		{"forced shutdown while discharging", "OB LB FSD", true},
+		{"online", "OL", false},
+		{"online and charging", "OL CHRG", false},
+		{"unreadable UPS", "unknown", false},
+		{"no UPS at all", "", false},
+		// A substring is not a flag: NUT reports a space-separated set, and
+		// "OBSCURE" must not read as "OB".
+		{"substring is not membership", "OBSCURE", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := powerIsTheReason(tc.status); got != tc.want {
+				t.Fatalf("powerIsTheReason(%q) = %v, want %v", tc.status, got, tc.want)
 			}
 		})
 	}

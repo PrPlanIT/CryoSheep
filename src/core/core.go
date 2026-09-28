@@ -75,6 +75,11 @@ const (
 	StatusOnline    = "OL"
 	StatusOnBattery = "OB"
 	StatusLowBatt   = "LB"
+
+	// StatusFSD is upsmon's forced shutdown. It appears once the decision has
+	// been taken rather than while it is being weighed, so it means power just
+	// as much as OB does.
+	StatusFSD = "FSD"
 )
 
 // Units reports on the init system. Implemented over systemd.

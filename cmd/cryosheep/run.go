@@ -177,6 +177,27 @@ func envDuration(key string) time.Duration {
 	return d
 }
 
+// powerIsTheReason reports whether the UPS says power is why we are stopping.
+//
+// Asked of the UPS rather than inferred from whatever launched us, because the
+// launcher cannot say. Proved against NUT 2.8.3: upsmon sets NOTIFYTYPE for
+// NOTIFYCMD and passes nothing at all to SHUTDOWNCMD — and because upsmon runs
+// as a systemd service, its children inherit INVOCATION_ID, so an environment
+// sniff concludes "systemd asked for this" on exactly the path where nobody
+// did. That answer switches off the gate, and the gate is what lets mains
+// returning abandon a sequence nobody needed.
+//
+// The UPS is the authority on this, and the gate already re-reads it to decide
+// whether to abandon — so both decisions now come from one source that cannot
+// disagree with itself.
+//
+// An unreadable UPS reads false, which is the honest answer rather than a
+// pessimistic one: without it there is no way to observe mains returning, so
+// there is nothing to gate on either way.
+func powerIsTheReason(status string) bool {
+	return nut.Flag(status, core.StatusOnBattery) || nut.Flag(status, core.StatusFSD)
+}
+
 // detectTrigger establishes why this run is happening, from the environment of
 // whatever started it.
 //
@@ -283,7 +304,7 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 	}
 	p := plan.Build(host, roles, guests, status, opts)
 	e := &execute.Executor{Hyp: hyp, UPS: ups, Ceph: runner, Kube: runner, Host: halt,
-		Deadline: deadline, DryRun: f.dryRun}
+		Deadline: deadline, DryRun: f.dryRun, PowerLoss: powerIsTheReason(status)}
 	if _, _, remote := remoteTarget(); remote {
 		// Nothing local is being stopped, so the collaborators that act on this
 		// machine are dropped rather than left pointing at it.
@@ -412,7 +433,7 @@ func runSleep(args []string) int {
 	// An operator or a systemd reboot asked for this, and the UPS reporting
 	// healthy power is simply not news — gating there would abandon a shutdown
 	// that was requested, leaving guests running while the host stops under them.
-	e.NoGate = f.trigger != audit.TriggerUPS
+	e.NoGate = !e.PowerLoss
 
 	w := audit.Open(p.Host, f.trigger)
 	e.Record = w

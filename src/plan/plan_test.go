@@ -503,7 +503,7 @@ func stopWaves(t *testing.T, o Options) [][]string {
 func TestOrderGroupsCollapseRangesIntoOneWave(t *testing.T) {
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
 	})
 	want := [][]string{
 		{"204", "869", "107"}, // leaves and unordered, together
@@ -523,7 +523,7 @@ func TestOrderGroupsCollapseRangesIntoOneWave(t *testing.T) {
 func TestOrderGroupsKeepRangesInDeclaredOrder(t *testing.T) {
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
 	})
 	// The router must still be in the last wave: everything routed through it
 	// has to be gone before it goes.
@@ -551,7 +551,7 @@ func TestIncompleteOrderGroupsFallBackToTiers(t *testing.T) {
 	// guest from the sequence is not.
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 2}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 2}},
 	})
 	if len(got) != 6 {
 		t.Fatalf("waves = %v, want fallback to 6 tiers", got)
@@ -563,7 +563,7 @@ func TestOrderGroupsStillRespectConcurrency(t *testing.T) {
 	// actually do. A group of three at concurrency 2 is two waves, not one.
 	got := stopWaves(t, Options{
 		GuestConcurrency: 2,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
 	})
 	if len(got[0]) != 2 {
 		t.Fatalf("first wave = %v, want 2 guests at concurrency 2", got[0])
@@ -573,7 +573,7 @@ func TestOrderGroupsStillRespectConcurrency(t *testing.T) {
 func TestOrderGroupsDoNotDisturbTheHalt(t *testing.T) {
 	p := Build("h", []core.Role{core.RoleProxmox}, estate(), core.StatusOnBattery, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
 	})
 	a := actions(p)
 	if a[len(a)-1] != ActionHostHalt {
@@ -587,7 +587,7 @@ func TestRoutersCanBeIsolatedInTheirOwnFinalWave(t *testing.T) {
 	// own disk, but anything still draining over a routed path does not.
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{5, 99}, {4, 4}, {2, 3}, {1, 1}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {2, 3}, {Lo: 1, Hi: 1}},
 	})
 	if len(got) != 4 {
 		t.Fatalf("waves = %v, want 4 groups", got)

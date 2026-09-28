@@ -60,10 +60,14 @@ type Executor struct {
 	// DryRun walks and records the decisions without performing any of them.
 	DryRun bool
 
+	// PowerLoss is whether the UPS says power is why we are stopping. It decides
+	// gating: only a run the mains can make unnecessary is worth abandoning.
+	PowerLoss bool
+
 	// NoGate disables gating entirely, for a sequence whose decision is already
-	// made: upsmon's SHUTDOWNCMD is terminal, and a normal reboot reads OL —
-	// which would otherwise "abort" a shutdown systemd is performing anyway and
-	// leave guests running while the host stops underneath them.
+	// made: a normal reboot reads OL, and gating there would "abort" a shutdown
+	// systemd is performing anyway, leaving guests running while the host stops
+	// underneath them.
 	NoGate bool
 
 	// Clock is swappable so trend logic can be tested without waiting.
