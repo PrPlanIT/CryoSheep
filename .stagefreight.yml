@@ -51,7 +51,7 @@ metadata:
   description:
     - Shuts a host and its guests down in order, on power loss or a normal reboot.
     - 'Sequencer invoked by systemd on reboot and by upsmon when a UPS gives up: stops guests over ACPI so they shut down properly rather than being yanked, quiesces Ceph, arms the UPS''s own power-off as a backstop, and journals every decision locally so an outage can be reconstructed once logging is back.'
-  license: MIT
+  license: AGPL-3.0-only
   org: PrPlanIT
   title: CryoSheep
   topics:
