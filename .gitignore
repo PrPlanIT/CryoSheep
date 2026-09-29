@@ -1,11 +1,11 @@
-# --- secrets / credentials — NEVER commit ---
-*vault-keys*
+
+.bin/
+.build/
+/cryosheep
 *.key
+# locally built binary
 *.pem
 *.secret
+# --- secrets / credentials — NEVER commit ---
 *token*
-
-.build/
-
-# locally built binary
-/cryosheep
+*vault-keys*

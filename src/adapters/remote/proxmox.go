@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/core"
@@ -61,15 +62,61 @@ func (p *Proxmox) Guests(ctx context.Context) ([]core.Guest, error) {
 			return nil, err
 		}
 		for _, g := range l.Data {
+			id := strconv.Itoa(g.VMID)
+
+			// The listing does not carry `startup`, so each guest's config is
+			// read for it. Without this the declared policy never reaches a
+			// remote host: every guest arrives unordered on the fallback budget,
+			// which puts a router in the same wave as the Kubernetes nodes that
+			// route through it.
+			order, down := core.OrderUnset, time.Duration(0)
+			var cfg pveConfig
+			if err := p.Client.do(ctx, http.MethodGet,
+				"/api2/json/nodes/"+p.Node+"/"+kind+"/"+id+"/config", nil, &cfg); err == nil {
+				order, down = parseStartup(cfg.Data.Startup)
+			}
+
 			out = append(out, core.Guest{
-				ID:     strconv.Itoa(g.VMID),
+				ID:     id,
 				Name:   g.Name,
 				Status: g.Status,
-				Order:  core.OrderUnset,
+				Order:  order,
+				Down:   down,
 			})
 		}
 	}
 	return out, nil
+}
+
+// pveConfig is the part of a guest config this needs.
+type pveConfig struct {
+	Data struct {
+		Startup string `json:"startup"`
+	} `json:"data"`
+}
+
+// parseStartup reads Proxmox's `startup` value — "order=4,up=200,down=240".
+//
+// The local adapter parses the same field out of `qm config` text; here it
+// arrives as one JSON string, so the scanning differs even though the grammar
+// does not. A value that will not parse yields the unset default rather than a
+// guess: an invented order is worse than none, because none is visible.
+func parseStartup(v string) (int, time.Duration) {
+	order, down := core.OrderUnset, time.Duration(0)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		switch {
+		case strings.HasPrefix(part, "order="):
+			if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(part, "order="))); err == nil {
+				order = n
+			}
+		case strings.HasPrefix(part, "down="):
+			if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(part, "down="))); err == nil {
+				down = time.Duration(n) * time.Second
+			}
+		}
+	}
+	return order, down
 }
 
 // kindOf asks which endpoint family a guest belongs to. Proxmox ids are unique

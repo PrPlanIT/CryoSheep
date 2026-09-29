@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/PrPlanIT/CryoSheep/src/core"
 )
 
 // fakePVE is enough of the Proxmox API to exercise the adapter without a
@@ -180,5 +182,103 @@ func TestRequestsAreBoundedByDefault(t *testing.T) {
 	defer cancel()
 	if err := c.do(ctx, http.MethodGet, "/", nil, nil); err == nil {
 		t.Fatal("want an error reaching an invalid host")
+	}
+}
+
+func TestParseStartup(t *testing.T) {
+	for _, tc := range []struct {
+		name, in  string
+		wantOrder int
+		wantDown  time.Duration
+	}{
+		{"empty means unordered", "", core.OrderUnset, 0},
+		{"order alone", "order=4", 4, 0},
+		{"order and down", "order=4,down=240", 4, 240 * time.Second},
+		{"the storage tier", "order=3,up=200,down=180", 3, 180 * time.Second},
+		{"down without order", "down=60", core.OrderUnset, 60 * time.Second},
+		{"up only", "up=0", core.OrderUnset, 0},
+		{"whitespace tolerated", " order=1 , down=120 ", 1, 120 * time.Second},
+		{"garbage is not an order", "order=x,down=90", core.OrderUnset, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, d := parseStartup(tc.in)
+			if o != tc.wantOrder || d != tc.wantDown {
+				t.Fatalf("parseStartup(%q) = (%d, %v), want (%d, %v)",
+					tc.in, o, d, tc.wantOrder, tc.wantDown)
+			}
+		})
+	}
+}
+
+// The declared policy only reaches a remote host if the adapter reads it. It
+// used to hardcode OrderUnset and never look at down=, so every guest landed in
+// one wave on the 180s fallback -- stopping a router at the same instant as the
+// Kubernetes nodes that route through it.
+func TestGuestsCarryTheDeclaredOrderAndBudget(t *testing.T) {
+	var rec []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec = append(rec, r.URL.Path)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/101/config"):
+			_, _ = w.Write([]byte(`{"data":{"startup":"order=4,down=240"}}`))
+		case strings.HasSuffix(r.URL.Path, "/202/config"):
+			_, _ = w.Write([]byte(`{"data":{"startup":"order=1,down=120"}}`))
+		case strings.HasSuffix(r.URL.Path, "/qemu"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":101,"name":"chest-001","status":"running"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/lxc"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":202,"name":"pve-ups","status":"running"}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":null}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	p := &Proxmox{Client: &Client{Base: srv.URL, Auth: TokenAuth{TokenID: "t", Secret: "s"}}, Node: "bamboo"}
+
+	gs, err := p.Guests(context.Background())
+	if err != nil {
+		t.Fatalf("Guests: %v", err)
+	}
+	want := map[string]struct {
+		order int
+		down  time.Duration
+	}{
+		"101": {4, 240 * time.Second},
+		"202": {1, 120 * time.Second},
+	}
+	if len(gs) != len(want) {
+		t.Fatalf("got %d guests, want %d", len(gs), len(want))
+	}
+	for _, g := range gs {
+		w := want[g.ID]
+		if g.Order != w.order || g.Down != w.down {
+			t.Fatalf("guest %s = (order %d, down %v), want (order %d, down %v)",
+				g.ID, g.Order, g.Down, w.order, w.down)
+		}
+	}
+}
+
+// A guest whose config cannot be read is still a guest that must be stopped.
+// Dropping it would leave it running when the host halts; the safe degradation
+// is to treat it as unordered on the default budget.
+func TestAnUnreadableConfigDoesNotLoseTheGuest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/config"):
+			w.WriteHeader(http.StatusInternalServerError)
+		case strings.HasSuffix(r.URL.Path, "/qemu"):
+			_, _ = w.Write([]byte(`{"data":[{"vmid":101,"name":"chest-001","status":"running"}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	p := &Proxmox{Client: &Client{Base: srv.URL, Auth: TokenAuth{TokenID: "t", Secret: "s"}}, Node: "bamboo"}
+
+	gs, err := p.Guests(context.Background())
+	if err != nil {
+		t.Fatalf("Guests: %v", err)
+	}
+	if len(gs) != 1 || gs[0].ID != "101" || gs[0].Order != core.OrderUnset {
+		t.Fatalf("guests = %+v, want one unordered guest 101", gs)
 	}
 }
