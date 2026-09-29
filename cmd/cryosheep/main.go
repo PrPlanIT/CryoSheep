@@ -188,11 +188,10 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 			"  set it in Proxmox to control this: order=1 boots first and stops last.\n")
 	}
 
-	// Worst case has to fit inside the battery, not the typical case.
-	var worst time.Duration
-	for _, s := range p.Steps {
-		worst += s.Timeout
-	}
+	// Worst case has to fit inside the battery, not the typical case. Wave-aware:
+	// a wave costs what its slowest member costs, so summing every step would
+	// overstate the ceiling precisely when concurrency is configured correctly.
+	worst := p.WorstCase()
 	if worst > 0 {
 		line := fmt.Sprintf("\nworst case: %s", worst)
 		if runtime > 0 {
@@ -201,8 +200,18 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 		fmt.Println(line)
 		if runtime > 0 && worst > runtime {
 			fmt.Printf("  WARNING: the sequence cannot complete at this load — %s short.\n"+
-				"  shorten --guest-timeout, stop non-critical guests earlier, or rely on the UPS deadline.\n",
+				"  shorten the guests' down=, stop non-critical guests earlier, or rely on the UPS deadline.\n",
 				worst-runtime)
+		}
+		// The battery is not the only bound, and on a host with no UPS of its own
+		// it is not a bound at all. This run gets sequenceTimeout whatever the
+		// power situation, so say when the plan cannot fit inside its own budget
+		// rather than letting it be discovered by a truncated sequence.
+		if worst > sequenceTimeout {
+			fmt.Printf("  WARNING: worst case exceeds this run's own budget of %s by %s.\n"+
+				"  the sequence would be cut short mid-step; raise the guests' down= discipline\n"+
+				"  or accept that the last wave relies on the deadline rather than finishing.\n",
+				sequenceTimeout, worst-sequenceTimeout)
 		}
 	}
 }

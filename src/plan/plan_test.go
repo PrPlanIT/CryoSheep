@@ -603,3 +603,49 @@ func TestRoutersCanBeIsolatedInTheirOwnFinalWave(t *testing.T) {
 		}
 	}
 }
+
+func TestWorstCaseIsWaveAwareNotSerial(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "110", Name: "ant", Status: "running", Order: 5, Down: 90 * time.Second},
+		{ID: "205", Name: "map", Status: "running", Order: 4, Down: 240 * time.Second},
+		{ID: "206", Name: "chest", Status: "running", Order: 4, Down: 240 * time.Second},
+		{ID: "200", Name: "pfsense", Status: "running", Order: 1, Down: 120 * time.Second},
+	}
+	serial := Build("h", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery,
+		Options{GuestConcurrency: 1}).WorstCase()
+	waves := Build("h", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery,
+		Options{GuestConcurrency: AllAtOnce}).WorstCase()
+
+	// Serial pays for both order-4 guests; in one wave they overlap, so the
+	// tier costs what its slowest member costs, once.
+	if waves >= serial {
+		t.Fatalf("waves = %v, serial = %v — concurrency must reduce the ceiling", waves, serial)
+	}
+	if got, want := serial-waves, 240*time.Second; got != want {
+		t.Fatalf("difference = %v, want %v (the second order-4 guest)", got, want)
+	}
+}
+
+func TestWorstCaseCountsEachWaveOnce(t *testing.T) {
+	guests := []core.Guest{
+		{ID: "1", Status: "running", Order: 4, Down: 100 * time.Second},
+		{ID: "2", Status: "running", Order: 4, Down: 30 * time.Second},
+	}
+	p := Build("h", []core.Role{core.RoleProxmox}, guests, core.StatusOnBattery,
+		Options{GuestConcurrency: AllAtOnce})
+	// One wave of two guests costs the slower of them, not their sum.
+	var guestPart time.Duration
+	for _, s := range p.Steps {
+		if s.Action == ActionGuestStop {
+			if s.Timeout > guestPart {
+				guestPart = s.Timeout
+			}
+		}
+	}
+	if guestPart != 100*time.Second {
+		t.Fatalf("slowest guest = %v, want 100s", guestPart)
+	}
+	if p.WorstCase() < 100*time.Second {
+		t.Fatalf("WorstCase = %v, want at least the slowest guest", p.WorstCase())
+	}
+}

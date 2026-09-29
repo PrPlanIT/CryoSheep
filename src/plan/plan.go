@@ -418,3 +418,24 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 	}
 	return p
 }
+
+// WorstCase is how long the sequence can take if every step runs out its budget.
+//
+// Wave-aware, because the steps of one wave run together: a wave costs what its
+// slowest member costs, not the sum of its members. Summing every step instead
+// overstates the ceiling exactly when concurrency has been configured correctly,
+// which teaches an operator to distrust the number at the moment it is right.
+func (p Plan) WorstCase() time.Duration {
+	var total time.Duration
+	var wave, slowest = -1, time.Duration(0)
+	for _, s := range p.Steps {
+		if s.Wave != wave {
+			total += slowest
+			wave, slowest = s.Wave, 0
+		}
+		if s.Timeout > slowest {
+			slowest = s.Timeout
+		}
+	}
+	return total + slowest
+}
