@@ -1,7 +1,7 @@
 # ------------------------------------------------------------------------------
 # GENERATED / ENFORCED BY STAGEFREIGHT GOVERNANCE
 # Source repo: PrPlanIT/MaintenancePolicy
-# Profile: prplanit-bin
+# Profile: prplanit-go-bin
 # This .stagefreight.yml is governed, not purely local.
 # To disable governance, detach from the control repo workflow.
 # Manual changes may be overwritten by reconciliation.
