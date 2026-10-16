@@ -64,9 +64,31 @@ type Guest struct {
 	// honours this field when it starts and stops guests itself, and two
 	// sources of truth for the same ordering would silently disagree.
 	Order int
+
+	// Tags are the guest's Proxmox tags. TagShed marks a guest that may stop
+	// as soon as an outage is confirmed, before anything is decided.
+	Tags []string
+
+	// Node is the Proxmox node the guest runs on. Set only by Estate, which
+	// sees the whole cluster.
+	Node string
 }
 
 func (g Guest) Running() bool { return g.Status == "running" }
+
+// TagShed marks a guest as non-essential: `conserve` stops it once an outage is
+// confirmed, to stretch the battery for everything else.
+const TagShed = "shed"
+
+// Tagged reports whether the guest carries tag t.
+func (g Guest) Tagged(t string) bool {
+	for _, x := range g.Tags {
+		if x == t {
+			return true
+		}
+	}
+	return false
+}
 
 // UPS status strings, as NUT reports them in ups.status. The value is a
 // space-separated set of flags, so callers test for membership rather than
@@ -100,6 +122,17 @@ type Hypervisor interface {
 	Start(ctx context.Context, id string) error
 }
 
+// Estate reads, never acts on, the guests running anywhere in the cluster.
+//
+// It lets a host stop waiting early: the router tier may stop once no guest that
+// depends on it is running on any node. Read from the cluster filesystem, which
+// travels over corosync rather than a routed path. A stale reading shows a guest
+// running after it stopped, which only makes the wait longer; it never makes it
+// shorter than the truth.
+type Estate interface {
+	Running(ctx context.Context) ([]Guest, error)
+}
+
 // Reading is one observation of the UPS.
 //
 // More than the status flag, because the flag alone is a poor test for "mains
@@ -123,6 +156,13 @@ const Unknown = -1
 // mid-sequence abandons the sequence rather than being noticed too late.
 type UPS interface {
 	Read(ctx context.Context) (Reading, error)
+}
+
+// Cutter tells the UPS to cut its output after a delay and restore it when
+// utility power is present. Sent once, as the last step before the halt, by a
+// host that can reach the UPS without anything it has just stopped.
+type Cutter interface {
+	Cut(ctx context.Context, after time.Duration) error
 }
 
 // Ceph stops and restarts the cluster's reaction to a host leaving. Only the
@@ -184,16 +224,4 @@ type Kube interface {
 // making it.
 type Host interface {
 	Poweroff(ctx context.Context) error
-}
-
-// Deadline is the UPS's own shutdown timer — the backstop that fires whether or
-// not the software sequence completed.
-//
-// This is the answer to a sequencer that cannot finish: a host that wedges, a
-// step that hangs, a run that never started. Armed while the UPS is still
-// reachable, cancelled if mains return. Nothing in software can guarantee an
-// ending; hardware honouring a timer it already holds can.
-type Deadline interface {
-	Arm(ctx context.Context, in time.Duration) error
-	Cancel(ctx context.Context) error
 }

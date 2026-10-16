@@ -40,39 +40,52 @@ can stop machines it does not live on is a tool that can stop the wrong one.
 Two deployments, one binary, differing only in what triggers them.
 
 ```
-Eaton UPS  (LAN, SNMP)
+Eaton UPS  (NM2, SNMP, VLAN 10 — every host has a leg on it)
   │
-  ├── avocado ─┐
-  ├── bamboo   │  Proxmox hosts: snmp-ups + upsmon + CryoSheep
-  ├── cosmos   │  → gate on UPS, stop guests in order=, stop self
-  ├── dragonfruit
-  └── eggplant ┘
-        │
+  │  each host: snmp-ups + upsd on localhost
+  ▼
+  avocado .. eggplant   Proxmox hosts: upsmon secondary + CryoSheep
+        │               → gate on UPS, stop guests in order=,
+        │                 send the cut, stop self
         │  qm shutdown (ACPI)
         ▼
-  k8s VMs, workstation, everything else
+  k8s VMs, everything else
        systemd + CryoSheep
        → local teardown, stop. Never talks to NUT.
 ```
 
-### Hosts read the UPS directly
+### Each host reads the UPS; the last step is the cut
 
-Each Proxmox host runs its **own** `snmp-ups` driver against the Eaton over LAN, with
-its own `upsmon`. No master, no slaves, no relaying.
+The UPS answers whether the mains are out. Each host answers when it commits and
+how it stops itself.
 
-- No single point of failure — the reason the UPS is on LAN rather than USB, applied
-  consistently to the readers as well.
-- No circular dependency. A NUT server living in k8s runs on a VM on a host it is
-  telling to shut down; it dies partway through and gating dies with it. Worse, its
-  location is dynamic while shutdown order must be static, so it cannot be pinned last.
-- Five readers, but no second authority: each host decides only about **itself**.
-  Nobody decides for anybody else.
+- **Same reading, same verdict.** Every host polls the NM2 with the same
+  `override.battery.runtime.low` and the same commit timer, so all five commit
+  within a poll of each other without talking.
+- **Commit early, stop fast, cut early.** The commit is a fixed time on battery,
+  with `runtime.low` as the floor. Charge left when the output goes off stays in
+  the battery for the next event and for the restart threshold.
+- **The cut is sent last.** Each host reaches the NM2 over its own VLAN 10 leg,
+  not through anything the sequence stops, so `shutdown.return <delay>` is the
+  step before the halt, at the shared barrier. Nothing is armed while guests can
+  still be given back, so a cancel never has to work. Mains back after the cut is
+  sent cycles an estate that is already down.
+- **No NUT primary.** Every `upsmon` is a secondary: no FSD, no `POWERDOWNFLAG`,
+  so NUT's own end-of-shutdown command (`load.off.delay` on this driver: off,
+  never back on) is never sent.
+- **A host that cannot read the UPS never commits.** The others' early release
+  waits on its guests, runs to the ceiling, and their cut catches it. Alert on a
+  stale driver before an outage; `wake` reports the cut run after it. The NM2's
+  own outage sequence is the backstop for every host dead before the commit.
 
-`nutify` keeps what it is good at — diagnostics, history, and the operator
-notification, which is sent at second zero while the cluster is certainly alive.
+`nutify` is a read-only client: diagnostics, history, and the operator
+notification.
 
-> nutify announces, because it is alive when announcements matter.
-> The hosts decide, because they are alive when decisions matter.
+### Reading the estate is not acting on it
+
+A host never stops another host's guests. It may read which guests run anywhere —
+from `/etc/pve`, over corosync — to stop waiting early. Stale readings show guests
+running after they stopped, so they lengthen a wait and never shorten it.
 
 ### Guests do not gate
 
@@ -92,9 +105,10 @@ being stopped.
 
 | trigger | verb | halts? |
 |---|---|---|
-| `upsmon` NOTIFYCMD, ONBATT | `conserve` | no — reversible prefix only |
-| `upsmon` NOTIFYCMD, ONLINE | `cancel` | no — reverses in LIFO order |
-| `upsmon` SHUTDOWNCMD, LOWBATT/FSD | `sleep` | yes |
+| `upssched`, ONBATT past the linger | `conserve` | no — stops `shed`-tagged guests only |
+| `upssched`, ONLINE | `cancel` | no — reverses the event's runs in LIFO order |
+| `upssched`, commit timer (90s on battery) | `sleep` | yes, after the UPS cut |
+| `upsmon` SHUTDOWNCMD, `runtime.low` floor | `sleep` | yes, after the UPS cut |
 | `systemctl poweroff` | `sleep` | systemd halts; CryoSheep must not |
 | `systemctl reboot` | `sleep` | **no** — the machine is coming back |
 | `qm shutdown` (ACPI from the host) | `sleep` | systemd halts; CryoSheep must not |
@@ -108,7 +122,9 @@ handler during a **reboot**, that powers the machine off instead — a remote re
 that never returns, and on a guest one that needs a hand on the hypervisor to fix.
 
 CryoSheep must do the teardown and let systemd finish the transition it had already
-started. Flag name is an open decision (§7).
+started. It knows which case it is in from `SERVICE_RESULT`, which systemd passes
+only to `ExecStop`. `INVOCATION_ID` does not tell them apart: upsmon's
+`SHUTDOWNCMD` inherits it, and must halt.
 
 ### Unit shape
 
@@ -121,7 +137,7 @@ Requires=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/true
-ExecStop=/usr/local/bin/cryosheep sleep --trigger systemd <no-halt flag>
+ExecStop=/usr/local/bin/cryosheep sleep
 TimeoutStopSec=120
 
 [Install]
@@ -225,17 +241,13 @@ carrying per-host detail, and a Grafana dashboard that is blank on an ordinary d
 
 ## 7. Open decisions
 
-1. **The no-halt flag name.** `--no-poweroff`, `--teardown-only`, or a word in the
-   cryo idiom. Blocks the systemd units and Drill B.
-2. **Operator-facing wording** — notification text, `cut`/`graceful` vocabulary,
+1. **Operator-facing wording** — notification text, `cut`/`graceful` vocabulary,
    channel names. Pending sign-off; `Presentation_Layer.md` is deliberately empty
    until then.
-3. **`shutdownGracePeriod` is `0s`** fleet-wide. Until it is set, pods are killed
-   rather than sent SIGTERM, so no shutdown is clean and the platform's own recovery
-   assumptions do not hold.
-4. **Per-guest `order=` / `down=`** is set only on pfSense and Zebrina. Everything
-   else falls back to a flat 90s.
-5. **Eaton NMC polling** — confirm it tolerates five SNMP pollers.
-6. **Nothing has run outside `--dry-run`** except the two reversible drills on
-   `dungeon-chest-004`. `load.off.delay` and `shutdown.stop` have never touched
-   hardware.
+2. **Which guests are `shed`.** The tag exists; no guest carries it yet.
+3. **Eaton NM2 polling** — five hosts, nutify and the exporter; confirm the card
+   tolerates seven SNMPv3 pollers.
+4. **Not yet on hardware:** `shutdown.return` sent by five hosts within seconds,
+   the output restoring with utility present, and the core hold releasing from
+   the estate reading. Bamboo's full shutdown on 2026-09-28 is the only
+   end-to-end run.

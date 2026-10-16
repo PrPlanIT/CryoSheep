@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/PrPlanIT/CryoSheep/src/audit"
 	"github.com/PrPlanIT/CryoSheep/src/plan"
 )
 
@@ -24,8 +25,8 @@ func TestFlagsReachTheOptions(t *testing.T) {
 		},
 		{
 			name: "flags are taken",
-			args: []string{"--guest-concurrency=-1", "--hold-until=4m", "--ups-deadline=5m30s"},
-			want: plan.Options{GuestConcurrency: -1, HoldUntil: 4 * time.Minute, UPSDeadline: 5*time.Minute + 30*time.Second},
+			args: []string{"--guest-concurrency=-1", "--hold-until=4m"},
+			want: plan.Options{GuestConcurrency: -1, HoldUntil: 4 * time.Minute},
 		},
 		{
 			name: "environment supplies the default, so a unit file can carry it",
@@ -54,9 +55,6 @@ func TestFlagsReachTheOptions(t *testing.T) {
 			}
 			if f.holdUntil != tc.want.HoldUntil {
 				t.Errorf("HoldUntil = %v, want %v", f.holdUntil, tc.want.HoldUntil)
-			}
-			if tc.want.UPSDeadline != 0 && f.upsDeadline != tc.want.UPSDeadline {
-				t.Errorf("UPSDeadline = %v, want %v", f.upsDeadline, tc.want.UPSDeadline)
 			}
 		})
 	}
@@ -124,6 +122,9 @@ func TestParseOrderGroups(t *testing.T) {
 		{"reversed range is refused whole", "5-99,9-4", nil},
 		{"non-numeric is refused whole", "5-99,four", nil},
 		{"zero is refused whole", "0-3", nil},
+		{"a hold rides on its range", "4-99,1-3@4m30s", []plan.OrderGroup{{Lo: 4, Hi: 99}, {Lo: 1, Hi: 3, NotBefore: 4*time.Minute + 30*time.Second}}},
+		{"a malformed hold is refused whole", "4-99,1-3@soon", nil},
+		{"a negative hold is refused whole", "4-99,1-3@-1m", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := parseOrderGroups(tc.spec)
@@ -147,24 +148,53 @@ func TestParseOrderGroups(t *testing.T) {
 // "an operator asked for this" on precisely the path where nobody did.
 func TestPowerIsTheReason(t *testing.T) {
 	for _, tc := range []struct {
-		name, status string
-		want         bool
+		name, status, trigger string
+		want                  bool
 	}{
-		{"on battery", "OB", true},
-		{"on battery, low", "OB LB", true},
-		{"forced shutdown", "FSD", true},
-		{"forced shutdown while discharging", "OB LB FSD", true},
-		{"online", "OL", false},
-		{"online and charging", "OL CHRG", false},
-		{"unreadable UPS", "unknown", false},
-		{"no UPS at all", "", false},
+		{"on battery", "OB", audit.TriggerManual, true},
+		{"on battery, low", "OB LB", audit.TriggerManual, true},
+		{"forced shutdown", "FSD", audit.TriggerManual, true},
+		{"forced shutdown while discharging", "OB LB FSD", audit.TriggerManual, true},
+		{"online", "OL", audit.TriggerManual, false},
+		{"online and charging", "OL CHRG", audit.TriggerManual, false},
+		{"unreadable UPS", "unknown", audit.TriggerManual, false},
+		{"no UPS at all", "", audit.TriggerManual, false},
+		// upsmon runs SHUTDOWNCMD only on a power decision; endpoints gone by then
+		// must not turn it into a plain stop.
+		{"upsmon, UPS unreadable", "unknown", audit.TriggerUPS, true},
+		{"upsmon, mains back", "OL", audit.TriggerUPS, false},
 		// A substring is not a flag: NUT reports a space-separated set, and
 		// "OBSCURE" must not read as "OB".
-		{"substring is not membership", "OBSCURE", false},
+		{"substring is not membership", "OBSCURE", audit.TriggerManual, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := powerIsTheReason(tc.status); got != tc.want {
-				t.Fatalf("powerIsTheReason(%q) = %v, want %v", tc.status, got, tc.want)
+			if got := powerIsTheReason(tc.status, tc.trigger); got != tc.want {
+				t.Fatalf("powerIsTheReason(%q, %q) = %v, want %v", tc.status, tc.trigger, got, tc.want)
+			}
+		})
+	}
+}
+
+// upsmon runs under systemd, so its SHUTDOWNCMD inherits INVOCATION_ID. Only our
+// own ExecStop gets SERVICE_RESULT; reading INVOCATION_ID as "systemd is stopping
+// this machine" made the UPS path decline to act and omit the halt.
+func TestDetectTrigger(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{"the stasis unit's ExecStop", map[string]string{"SERVICE_RESULT": "success", "INVOCATION_ID": "x"}, audit.TriggerSystemd},
+		{"upsmon SHUTDOWNCMD, a child of upsmon.service", map[string]string{"INVOCATION_ID": "x"}, audit.TriggerUPS},
+		{"upsmon NOTIFYCMD", map[string]string{"NOTIFYTYPE": "ONBATT", "INVOCATION_ID": "x"}, audit.TriggerUPS},
+		{"an operator at a shell", nil, audit.TriggerManual},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{"SERVICE_RESULT", "INVOCATION_ID", "NOTIFYTYPE"} {
+				t.Setenv(k, tc.env[k])
+			}
+			if got := detectTrigger(); got != tc.want {
+				t.Fatalf("detectTrigger() = %q, want %q", got, tc.want)
 			}
 		})
 	}

@@ -23,15 +23,53 @@ import (
 
 const DefaultPort = "3493"
 
+// Client reads one upsd. Reading needs no credentials; the one command it sends,
+// the cut, needs User and Pass.
 type Client struct {
 	Addr    string // host:port
 	UPS     string // UPS name as upsd knows it
 	Timeout time.Duration
+	User    string
+	Pass    string
+}
 
-	// Credentials for instant commands. Reading variables needs none; arming or
-	// cancelling the UPS deadline does.
-	User string
-	Pass string
+// Endpoints are several upsd instances serving the same UPS, read in order.
+// The first answer wins, so one dead endpoint does not blind the gate.
+type Endpoints []*Client
+
+// Read returns the first endpoint's reading that succeeds.
+func (e Endpoints) Read(ctx context.Context) (core.Reading, error) {
+	err := fmt.Errorf("nut: no endpoint configured")
+	for _, c := range e {
+		var r core.Reading
+		if r, err = c.Read(ctx); err == nil {
+			return r, nil
+		}
+	}
+	return core.Reading{}, err
+}
+
+// Runtime returns the first endpoint's battery.runtime that succeeds.
+func (e Endpoints) Runtime(ctx context.Context) (time.Duration, error) {
+	err := fmt.Errorf("nut: no endpoint configured")
+	for _, c := range e {
+		var d time.Duration
+		if d, err = c.Runtime(ctx); err == nil {
+			return d, nil
+		}
+	}
+	return 0, err
+}
+
+// Cut asks the first endpoint that accepts it.
+func (e Endpoints) Cut(ctx context.Context, after time.Duration) error {
+	err := fmt.Errorf("nut: no endpoint configured")
+	for _, c := range e {
+		if err = c.Cut(ctx, after); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func New(addr, ups string) *Client {
@@ -158,23 +196,32 @@ func (c *Client) Runtime(ctx context.Context) (time.Duration, error) {
 	return time.Duration(secs) * time.Second, nil
 }
 
-// InstCmd sends an instant command.
+// Cut sends shutdown.return with the delay in seconds: output off after it,
+// back on once utility power is present. The driver has no usable default delay,
+// so it is always given.
+func (c *Client) Cut(ctx context.Context, after time.Duration) error {
+	secs := int(after.Seconds())
+	if secs <= 0 {
+		return fmt.Errorf("nut: cut delay must be positive, got %s", after)
+	}
+	return c.InstCmd(ctx, "shutdown.return", strconv.Itoa(secs))
+}
+
+// InstCmd sends an instant command and waits for the driver's verdict.
 //
-// Unlike reading a variable this requires an authenticated user with instcmds
-// permission, so User/Pass must be set. NUT authentication is plaintext, so the
-// credential is only as protected as the path to upsd — worth remembering when
-// deciding which networks may reach port 3493.
+// upsd's plain OK only means it queued the command. With tracking on it returns
+// an id, and GET TRACKING reports PENDING until the driver answers SUCCESS or an
+// ERR. A upsd without tracking falls back to the plain OK.
 //
-// The password is never logged, and never placed in argv: it is read from
-// configuration and written straight to the socket.
+// NUT authentication is plaintext; the password is written to the socket only,
+// never logged or placed in argv.
 func (c *Client) InstCmd(ctx context.Context, cmd, param string) error {
 	if c.User == "" || c.Pass == "" {
-		return fmt.Errorf("nut: %s needs credentials (instant commands are authenticated)", cmd)
+		return fmt.Errorf("nut: %s needs the MONITOR line's user and password", cmd)
 	}
-
 	timeout := c.Timeout
 	if timeout <= 0 {
-		timeout = 5 * time.Second
+		timeout = 3 * time.Second
 	}
 	d := net.Dialer{Timeout: timeout}
 	conn, err := d.DialContext(ctx, "tcp", c.Addr)
@@ -182,59 +229,78 @@ func (c *Client) InstCmd(ctx context.Context, cmd, param string) error {
 		return fmt.Errorf("nut dial %s: %w", c.Addr, err)
 	}
 	defer conn.Close()
-
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	} else {
-		_ = conn.SetDeadline(time.Now().Add(timeout))
+		_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
 	}
 	r := bufio.NewReader(conn)
 
-	say := func(line, what string) error {
+	ask := func(line string) (string, error) {
 		if _, err := fmt.Fprintf(conn, "%s\n", line); err != nil {
-			return fmt.Errorf("nut write %s: %w", what, err)
+			return "", fmt.Errorf("nut write: %w", err)
 		}
 		reply, err := r.ReadString('\n')
 		if err != nil {
-			return fmt.Errorf("nut read %s: %w", what, err)
+			return "", fmt.Errorf("nut read: %w", err)
 		}
-		reply = strings.TrimSpace(reply)
+		return strings.TrimSpace(reply), nil
+	}
+	must := func(line, what string) error {
+		reply, err := ask(line)
+		if err != nil {
+			return err
+		}
 		if !strings.HasPrefix(reply, "OK") {
 			return fmt.Errorf("nut %s: %s", what, reply)
 		}
 		return nil
 	}
 
-	if err := say("USERNAME "+c.User, "USERNAME"); err != nil {
+	if err := must("USERNAME "+c.User, "USERNAME"); err != nil {
 		return err
 	}
-	// Only the outcome of this is ever surfaced, never the value.
-	if err := say("PASSWORD "+c.Pass, "PASSWORD"); err != nil {
+	if err := must("PASSWORD "+c.Pass, "PASSWORD"); err != nil {
 		return err
+	}
+	tracking := false
+	if reply, err := ask("SET TRACKING ON"); err != nil {
+		return err
+	} else {
+		tracking = strings.HasPrefix(reply, "OK")
 	}
 
 	line := fmt.Sprintf("INSTCMD %s %s", c.UPS, cmd)
 	if param != "" {
 		line += " " + param
 	}
-	if err := say(line, cmd); err != nil {
+	reply, err := ask(line)
+	if err != nil {
 		return err
 	}
-	fmt.Fprint(conn, "LOGOUT\n")
-	return nil
-}
-
-// Arm sets the UPS to cut power after in. Implements core.Deadline.
-func (c *Client) Arm(ctx context.Context, in time.Duration) error {
-	secs := int(in.Seconds())
-	if secs <= 0 {
-		return fmt.Errorf("nut: deadline must be positive, got %s", in)
+	if !strings.HasPrefix(reply, "OK") {
+		return fmt.Errorf("nut %s: %s", cmd, reply)
 	}
-	return c.InstCmd(ctx, "load.off.delay", strconv.Itoa(secs))
-}
-
-// Cancel stops a shutdown the UPS has already been told to perform.
-// Implements core.Deadline.
-func (c *Client) Cancel(ctx context.Context) error {
-	return c.InstCmd(ctx, "shutdown.stop", "")
+	id, ok := strings.CutPrefix(reply, "OK TRACKING ")
+	if !tracking || !ok {
+		return nil
+	}
+	for {
+		st, err := ask("GET TRACKING " + strings.TrimSpace(id))
+		if err != nil {
+			return err
+		}
+		switch {
+		case st == "SUCCESS":
+			fmt.Fprint(conn, "LOGOUT\n")
+			return nil
+		case st != "PENDING":
+			return fmt.Errorf("nut %s: %s", cmd, st)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("nut %s: still pending: %w", cmd, ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }

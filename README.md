@@ -5,8 +5,8 @@ else that asks it to stop.
 
 > **Not GA.** This is being actively experimented with on one estate. Interfaces
 > and flags will change without ceremony. The reversible half runs on a real node;
-> the irreversible tail — releasing storage mounts, the poweroff itself, and the
-> UPS power-cut backstop — has never been executed outside a rehearsal. Read it,
+> the irreversible tail — releasing storage mounts and the poweroff itself — has
+> never been executed outside a rehearsal. Read it,
 > borrow from it, but do not point it at anything you are not prepared to lose.
 
 <!-- sf:project:start -->
@@ -43,8 +43,12 @@ the node — **never drains it**, because in a full shutdown there is nowhere fo
 database primary to go except another machine that is also stopping. Releases CSI
 mounts before the network disappears, which is what a stock shutdown stalls on.
 Stops guests over ACPI (`qm shutdown`, not `qm stop`) in **reverse Proxmox
-`startup: order=`**, honouring each guest's own `down=` budget. Arms the UPS's own
-power-off first, as a backstop for a sequence that cannot finish.
+`startup: order=`**, honouring each guest's own `down=` budget. On a power event
+every host acts on one signal: a held group — the routers — waits until a set
+time after it, or until no guest that depends on it is running on any node,
+whichever is first. The last step before the halt tells the UPS to cut its output
+shortly after and restore it with utility power, so the charge left stays in the
+battery and the hosts come back on their own.
 
 And it undoes all of it if mains return before the point of no return.
 
@@ -87,19 +91,24 @@ INVOCATION_ID=rehearsal cryosheep sleep --dry-run
 | | |
 |---|---|
 | `plan` | show what would happen; changes nothing |
-| `conserve` | shed load and hold, reversibly — `upsmon` `NOTIFYCMD`, `ONBATT` |
+| `conserve` | stop guests tagged `shed`, reversibly — `upssched`, once the outage is confirmed |
 | `cancel` | abandon a sleep and undo it — `NOTIFYCMD`, `ONLINE` |
 | `sleep` | the whole sequence — `SHUTDOWNCMD`, or a unit's `ExecStop` |
 | `wake` | revive after stasis — on boot |
-| `calibrate` | recommend a deadline from what past runs actually cost |
+| `calibrate` | recommend `runtime.low` from what past runs actually cost |
 
-Three flags, all optional:
+Flags, all optional; each policy flag reads its default from the environment so
+the unit file can carry it:
 
 | | |
 |---|---|
 | `--dry-run` | walk and record the decisions without performing them |
-| `--ups-deadline` | when the UPS cuts power regardless — `CRYOSHEEP_UPS_DEADLINE` |
 | `--kubeconfig` | identity for `kubectl` — `CRYOSHEEP_KUBECONFIG` |
+| `--guest-concurrency` | guests stopping at once; `-1` a whole tier — `CRYOSHEEP_GUEST_CONCURRENCY` |
+| `--order-groups` | ranges that stop together on a power event, `@d` holds one — `CRYOSHEEP_ORDER_GROUPS` |
+| `--hold-until` | earliest halt on a power event — `CRYOSHEEP_HOLD_UNTIL` |
+| `--ups-cut` | delay sent with `shutdown.return` just before a power-event halt — `CRYOSHEEP_UPS_CUT` |
+| `--power-loss` | `plan` only: show the power-event plan on an ordinary day |
 
 Everything else is either a constant or something another system already owns: the
 UPS connection is read from `/etc/nut/upsmon.conf`, the per-guest budget from
@@ -172,9 +181,9 @@ At a terminal the same run reads as prose rather than JSON:
 
 ## Calibration
 
-The UPS deadline should be measured, not chosen. It sits between two failure
-modes: too short cuts power mid-flush and produces the unclean stop everything
-else exists to prevent; too long and the battery is flat before it fires.
+The trigger threshold, `override.battery.runtime.low`, should be measured, not
+chosen. Too low and the battery is flat before the sequence finishes; too high and
+short outages cost a full shutdown.
 
 ```sh
 cryosheep calibrate

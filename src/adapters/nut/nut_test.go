@@ -119,9 +119,7 @@ func TestNewDefaultsPort(t *testing.T) {
 // fakeUpsd speaks just enough of the protocol to verify the exchange, and
 // records what it was told.
 // recorded is the lines the fake upsd saw. It is behind a mutex because the
-// server runs on its own goroutine and the test reads it from another: without
-// this the race detector fails the test that covers arming the UPS deadline,
-// which is the backstop the whole shutdown design leans on.
+// server runs on its own goroutine and the test reads it from another.
 type recorded struct {
 	mu    sync.Mutex
 	lines []string
@@ -147,11 +145,7 @@ func fakeUpsd(t *testing.T, replies map[string]string) (addr string, got *record
 	}
 	t.Cleanup(func() { ln.Close() })
 	lines := &recorded{}
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
+	serve := func(conn net.Conn) {
 		defer conn.Close()
 		r := bufio.NewReader(conn)
 		for {
@@ -171,76 +165,67 @@ func fakeUpsd(t *testing.T, replies map[string]string) (addr string, got *record
 				conn.Write([]byte("OK\n"))
 			}
 		}
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serve(conn)
+		}
 	}()
 	return ln.Addr().String(), lines
 }
 
-func TestArmSendsLoadOffDelayWithSeconds(t *testing.T) {
-	addr, got := fakeUpsd(t, nil)
-	c := New(addr, "ups")
-	c.User, c.Pass = "cryosheep", "secret"
-
-	if err := c.Arm(context.Background(), 90*time.Second); err != nil {
+// Two upsd endpoints carry the same UPS. A read answered by either is a read; a
+// dead first endpoint must not blind the gate.
+func TestEndpointsFallThroughToALiveOne(t *testing.T) {
+	addr, _ := fakeUpsd(t, map[string]string{"GET": `VAR ups ups.status "OB"`})
+	e := Endpoints{New("127.0.0.1:1", "ups"), New(addr, "ups")}
+	r, err := e.Read(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	// LOGOUT is courtesy sent after the command is already acknowledged, and its
-	// delivery races the close — the meaningful exchange is what precedes it.
-	want := []string{"USERNAME cryosheep", "PASSWORD secret", "INSTCMD ups load.off.delay 90"}
-	if len(got.all()) < len(want) {
-		t.Fatalf("exchange = %v, want it to begin %v", got.all(), want)
+	if r.Status != "OB" {
+		t.Fatalf("Status = %q, want OB from the live endpoint", r.Status)
 	}
-	for i := range want {
-		if (got.all())[i] != want[i] {
-			t.Fatalf("exchange = %v, want it to begin %v", got.all(), want)
+}
+
+func TestEndpointsAllDeadIsAnError(t *testing.T) {
+	e := Endpoints{New("127.0.0.1:1", "ups"), New("127.0.0.1:2", "ups")}
+	if _, err := e.Read(context.Background()); err == nil {
+		t.Fatal("expected an error when no endpoint answers")
+	}
+}
+
+func TestCutWaitsForTheDriversVerdict(t *testing.T) {
+	addr, got := fakeUpsd(t, map[string]string{"INSTCMD": "OK TRACKING 1f2e", "GET": "SUCCESS"})
+	c := New(addr, "eaton")
+	c.User, c.Pass = "cryosheep", "pw"
+	if err := c.Cut(context.Background(), 45*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"USERNAME cryosheep", "PASSWORD pw", "SET TRACKING ON", "INSTCMD eaton shutdown.return 45", "GET TRACKING 1f2e"}
+	lines := got.all()
+	for i, w := range want {
+		if i >= len(lines) || lines[i] != w {
+			t.Fatalf("conversation = %q, want it to start %q", lines, want)
 		}
 	}
 }
 
-func TestCancelSendsShutdownStop(t *testing.T) {
-	addr, got := fakeUpsd(t, nil)
-	c := New(addr, "ups")
-	c.User, c.Pass = "u", "p"
-	if err := c.Cancel(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, l := range got.all() {
-		if l == "INSTCMD ups shutdown.stop" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("exchange = %v, want an INSTCMD shutdown.stop", got.all())
+func TestCutReportsTheDriversRefusal(t *testing.T) {
+	addr, _ := fakeUpsd(t, map[string]string{"INSTCMD": "OK TRACKING 1f2e", "GET": "ERR CMD-NOT-SUPPORTED"})
+	c := New(addr, "eaton")
+	c.User, c.Pass = "cryosheep", "pw"
+	if err := c.Cut(context.Background(), 45*time.Second); err == nil {
+		t.Fatal("a refused command reported success")
 	}
 }
 
-// A rejected credential must surface as an error, not be mistaken for success —
-// silently failing to arm the backstop would remove the one guarantee that does
-// not depend on software completing.
-func TestRejectedCredentialIsAnError(t *testing.T) {
-	addr, _ := fakeUpsd(t, map[string]string{"PASSWORD": "ERR ACCESS-DENIED"})
-	c := New(addr, "ups")
-	c.User, c.Pass = "u", "wrong"
-	err := c.Arm(context.Background(), 60*time.Second)
-	if err == nil {
-		t.Fatal("expected an error on a rejected password")
-	}
-	if strings.Contains(err.Error(), "wrong") {
-		t.Fatalf("error leaked the credential: %v", err)
-	}
-}
-
-func TestInstCmdRefusesWithoutCredentials(t *testing.T) {
-	c := New("127.0.0.1:1", "ups")
-	if err := c.Cancel(context.Background()); err == nil {
-		t.Fatal("expected a refusal without credentials")
-	}
-}
-
-func TestArmRejectsNonPositiveDeadline(t *testing.T) {
-	c := New("127.0.0.1:1", "ups")
-	c.User, c.Pass = "u", "p"
-	if err := c.Arm(context.Background(), 0); err == nil {
-		t.Fatal("expected an error arming a zero deadline")
+func TestCutNeedsCredentials(t *testing.T) {
+	if err := New("127.0.0.1:1", "eaton").Cut(context.Background(), time.Minute); err == nil {
+		t.Fatal("sent a command without credentials")
 	}
 }

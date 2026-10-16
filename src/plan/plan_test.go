@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -273,14 +274,14 @@ func TestHaltIsPlannedWhenNothingElseIsStoppingUs(t *testing.T) {
 func TestOmitHaltChangesNothingBeforeIt(t *testing.T) {
 	roles := []core.Role{core.RoleKubelet, core.RoleCephOSD}
 	guests := []core.Guest{{ID: "100", Name: "pfsense", Status: "running", Order: 1}}
-	full := Build("h", roles, guests, "OB", Options{UPSDeadline: time.Minute})
-	short := Build("h", roles, guests, "OB", Options{UPSDeadline: time.Minute, OmitHalt: true})
+	full := Build("h", roles, guests, "OB", Options{})
+	short := Build("h", roles, guests, "OB", Options{OmitHalt: true})
 
 	if len(short.Steps) != len(full.Steps)-1 {
 		t.Fatalf("got %d steps, want %d", len(short.Steps), len(full.Steps)-1)
 	}
 	for i := range short.Steps {
-		if short.Steps[i] != full.Steps[i] {
+		if !reflect.DeepEqual(short.Steps[i], full.Steps[i]) {
 			t.Fatalf("step %d differs:\n  %+v\n  %+v", i, short.Steps[i], full.Steps[i])
 		}
 	}
@@ -303,8 +304,8 @@ func TestPointOfNoReturnSurvivesOmitHalt(t *testing.T) {
 // teardown — only the halt is absent.
 func TestSystemdPlanStillDescribesTheWholeTeardown(t *testing.T) {
 	p := Build("node-a", []core.Role{core.RoleKubelet, core.RoleCephOSD}, nil, "OB",
-		Options{UPSDeadline: time.Minute, OmitHalt: true})
-	want := []Action{ActionUPSDeadline, ActionCephNoout, ActionK8sRecord, ActionK8sCordon, ActionK8sUnmount}
+		Options{OmitHalt: true})
+	want := []Action{ActionCephNoout, ActionK8sRecord, ActionK8sCordon, ActionK8sUnmount}
 	if len(p.Steps) != len(want) {
 		t.Fatalf("got %d steps, want %d: %+v", len(p.Steps), len(want), p.Steps)
 	}
@@ -422,7 +423,7 @@ func TestNonGuestStepsNeverShareAWave(t *testing.T) {
 	p := Build("eggplant",
 		[]core.Role{core.RoleProxmox, core.RoleCephOSD, core.RoleKubelet},
 		guests, core.StatusOnBattery,
-		Options{UPSDeadline: 5 * time.Minute, GuestConcurrency: AllAtOnce})
+		Options{GuestConcurrency: AllAtOnce})
 
 	seen := map[int][]Action{}
 	for _, s := range p.Steps {
@@ -503,7 +504,7 @@ func stopWaves(t *testing.T, o Options) [][]string {
 func TestOrderGroupsCollapseRangesIntoOneWave(t *testing.T) {
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 3}},
 	})
 	want := [][]string{
 		{"204", "869", "107"}, // leaves and unordered, together
@@ -523,7 +524,7 @@ func TestOrderGroupsCollapseRangesIntoOneWave(t *testing.T) {
 func TestOrderGroupsKeepRangesInDeclaredOrder(t *testing.T) {
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 3}},
 	})
 	// The router must still be in the last wave: everything routed through it
 	// has to be gone before it goes.
@@ -551,7 +552,7 @@ func TestIncompleteOrderGroupsFallBackToTiers(t *testing.T) {
 	// guest from the sequence is not.
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 2}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 2}},
 	})
 	if len(got) != 6 {
 		t.Fatalf("waves = %v, want fallback to 6 tiers", got)
@@ -563,7 +564,7 @@ func TestOrderGroupsStillRespectConcurrency(t *testing.T) {
 	// actually do. A group of three at concurrency 2 is two waves, not one.
 	got := stopWaves(t, Options{
 		GuestConcurrency: 2,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 3}},
 	})
 	if len(got[0]) != 2 {
 		t.Fatalf("first wave = %v, want 2 guests at concurrency 2", got[0])
@@ -573,7 +574,7 @@ func TestOrderGroupsStillRespectConcurrency(t *testing.T) {
 func TestOrderGroupsDoNotDisturbTheHalt(t *testing.T) {
 	p := Build("h", []core.Role{core.RoleProxmox}, estate(), core.StatusOnBattery, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {1, 3}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 1, Hi: 3}},
 	})
 	a := actions(p)
 	if a[len(a)-1] != ActionHostHalt {
@@ -587,7 +588,7 @@ func TestRoutersCanBeIsolatedInTheirOwnFinalWave(t *testing.T) {
 	// own disk, but anything still draining over a routed path does not.
 	got := stopWaves(t, Options{
 		GuestConcurrency: AllAtOnce,
-		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {2, 3}, {Lo: 1, Hi: 1}},
+		OrderGroups:      []OrderGroup{{Lo: 5, Hi: 99}, {Lo: 4, Hi: 4}, {Lo: 2, Hi: 3}, {Lo: 1, Hi: 1}},
 	})
 	if len(got) != 4 {
 		t.Fatalf("waves = %v, want 4 groups", got)

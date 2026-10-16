@@ -49,13 +49,24 @@ func (nopRecorder) StepEnd(int, string, error)           {}
 func (nopRecorder) Note(int, string)                     {}
 
 type Executor struct {
-	Hyp      core.Hypervisor
-	UPS      core.UPS
-	Ceph     core.Ceph
-	Kube     core.Kube
-	Host     core.Host
-	Deadline core.Deadline
-	Record   Recorder
+	Hyp    core.Hypervisor
+	UPS    core.UPS
+	Ceph   core.Ceph
+	Kube   core.Kube
+	Host   core.Host
+	Cutter core.Cutter
+	Record Recorder
+
+	// Estate lets a hold release once nothing it waits on is running anywhere.
+	// Nil means holds run to their ceiling.
+	Estate core.Estate
+
+	// Poll is how often a hold re-reads the UPS and the estate.
+	Poll time.Duration
+
+	// ForceStopGrace is how long past its budget a guest stop may run, for the
+	// hypervisor to force the guest off. Zero takes the default.
+	ForceStopGrace time.Duration
 
 	// DryRun walks and records the decisions without performing any of them.
 	DryRun bool
@@ -81,6 +92,13 @@ type Executor struct {
 	// it exists to spend.
 	After func(time.Duration) <-chan time.Time
 }
+
+// defaultForceStopGrace is how long past its budget a guest stop may take, for
+// the hypervisor to force the guest off.
+const defaultForceStopGrace = 30 * time.Second
+
+// haltTimeout bounds issuing the poweroff, not the machine stopping.
+const haltTimeout = 30 * time.Second
 
 type Result struct {
 	Aborted   bool
@@ -116,32 +134,53 @@ func (e *Executor) Run(ctx context.Context, p plan.Plan) Result {
 	started := e.now()
 	held := false
 
+	abort := func(status string) Result {
+		res.Aborted = true
+		res.Gate = status
+		res.Reversed = e.reverse(ctx, reversible, rec, status)
+		return res
+	}
+
 	for _, wave := range waveIndices(p.Steps) {
 		first := wave[0]
+		gating := !e.NoGate && first <= pnr
+
+		// A group that must not start before the rest of the estate is done with
+		// it — the routers, while any node is still draining over them.
+		if s := p.Steps[first]; s.NotBefore > 0 {
+			status, back, waited := e.hold(ctx, &model, started, s.NotBefore, s.Clears, false, gating)
+			res.Held += waited
+			if back {
+				return abort(status)
+			}
+		}
 
 		// Gated once per wave rather than once per step. A wave is issued as a
 		// set, so there is no moment between its members at which abandoning it
 		// would be coherent: half a wave stopped is not a state the reversal
 		// path describes.
 		gate := ""
-		if !e.NoGate && first <= pnr {
+		if gating {
 			status, back := e.mainsBack(ctx, &model)
 			gate = status
 			if back {
-				res.Aborted = true
-				res.Gate = status
-				res.Reversed = e.reverse(ctx, reversible, rec, status)
-				return res
+				return abort(status)
 			}
 		}
 
 		// The barrier. Held before the first step that cannot be undone, so
 		// several hosts acting on one signal commit together rather than as each
 		// becomes ready. Waiting costs battery; not waiting costs whichever host
-		// was still writing to storage the early finishers took away.
+		// was still writing to storage the early finishers took away. Released
+		// early once no guest is running anywhere: with nothing writing, there is
+		// nothing for a staggered halt to strand.
 		if !held && p.HoldUntil > 0 && first >= pnr {
-			res.Held = e.hold(ctx, started, p.HoldUntil)
+			status, back, waited := e.hold(ctx, &model, started, p.HoldUntil, nil, true, gating)
+			res.Held += waited
 			held = true
+			if back {
+				return abort(status)
+			}
 		}
 
 		for _, r := range e.runWave(ctx, p.Steps, wave, rec, gate) {
@@ -178,22 +217,75 @@ func waveIndices(steps []plan.Step) [][]int {
 	return out
 }
 
-// hold waits until d has elapsed since the sequence began, and reports how long
-// it actually waited so the run can be calibrated.
-func (e *Executor) hold(ctx context.Context, started time.Time, d time.Duration) time.Duration {
-	wait := d - e.now().Sub(started)
-	if wait <= 0 {
-		return 0
+// hold waits until d has elapsed since the sequence began, or until the estate
+// clears, whichever is first, and reports how long it waited so the run can be
+// calibrated.
+//
+// The estate clears when no running guest falls in clears, or, with all, when no
+// guest is running at all. Unreadable is not clear: blindness never shortens a
+// wait. While gating, the UPS is re-read on every poll, so mains returning
+// during a long hold abandons the sequence then rather than after it.
+func (e *Executor) hold(ctx context.Context, model *ups.Model, started time.Time, d time.Duration,
+	clears []plan.OrderGroup, all, gating bool) (string, bool, time.Duration) {
+	poll := e.Poll
+	if poll <= 0 {
+		poll = 5 * time.Second
 	}
 	after := e.After
 	if after == nil {
 		after = time.After
 	}
-	select {
-	case <-ctx.Done():
-	case <-after(wait):
+	// Remaining is the lesser of the clock's answer and what is left after the
+	// waits already served, so a hold ends even if the clock does not move.
+	left := d - e.now().Sub(started)
+	var waited time.Duration
+	for {
+		remaining := d - e.now().Sub(started)
+		if r := left - waited; r < remaining {
+			remaining = r
+		}
+		if remaining <= 0 {
+			return "", false, waited
+		}
+		if gating {
+			if status, back := e.mainsBack(ctx, model); back {
+				return status, true, waited
+			}
+		}
+		if e.estateClear(ctx, clears, all) {
+			return "", false, waited
+		}
+		step, last := remaining, true
+		if poll < remaining {
+			step, last = poll, false
+		}
+		select {
+		case <-ctx.Done():
+			return "", false, waited
+		case <-after(step):
+		}
+		waited += step
+		if last {
+			return "", false, waited
+		}
 	}
-	return wait
+}
+
+// estateClear reports whether nothing the hold waits on is running anywhere.
+func (e *Executor) estateClear(ctx context.Context, clears []plan.OrderGroup, all bool) bool {
+	if e.Estate == nil || (!all && len(clears) == 0) {
+		return false
+	}
+	running, err := e.Estate.Running(ctx)
+	if err != nil {
+		return false
+	}
+	for _, g := range running {
+		if all || plan.Covers(clears, g) {
+			return false
+		}
+	}
+	return true
 }
 
 type waveResult struct {
@@ -253,13 +345,26 @@ func (e *Executor) runWave(ctx context.Context, steps []plan.Step, idxs []int, r
 // makes it structural, so a guest that never returns cannot hold its wave-mates
 // — or, in a serial plan, everything behind it.
 //
-// Only guest stops are bounded here. ActionUPSDeadline carries the deadline to
-// arm in the same field, which is a value rather than a budget for the call.
+// The bound is the budget plus ForceStopGrace. The adapter asks the hypervisor to
+// force the guest off once its budget runs out; cutting the call off at exactly
+// the budget would kill that request before it lands and leave the guest running.
+//
+// The cut and the halt are the opposite case: they run on a context detached
+// from the sequence, so a run that used up its own time still reaches them.
 func (e *Executor) stepCtx(ctx context.Context, s plan.Step) context.Context {
+	if s.Action == plan.ActionHostHalt || s.Action == plan.ActionUPSCut {
+		c, cancel := context.WithTimeout(context.WithoutCancel(ctx), haltTimeout)
+		_ = cancel
+		return c
+	}
 	if s.Action != plan.ActionGuestStop || s.Timeout <= 0 {
 		return ctx
 	}
-	c, cancel := context.WithTimeout(ctx, s.Timeout)
+	grace := e.ForceStopGrace
+	if grace <= 0 {
+		grace = defaultForceStopGrace
+	}
+	c, cancel := context.WithTimeout(ctx, s.Timeout+grace)
 	// The cancel is deliberately not deferred to the caller: the context is used
 	// only for the duration of the step, and letting it expire is the point.
 	_ = cancel
@@ -297,7 +402,7 @@ func (l *lockedRecorder) Note(i int, note string) {
 // the battery no longer draining with input power present.
 //
 // Unreadable means "no information", which is not the same as "mains are back"
-// and must not be treated as it. The armed hardware deadline covers the blind
+// and must not be treated as it. The UPS's own outage sequence covers the blind
 // case; this reacts only to something it can actually see.
 func (e *Executor) mainsBack(ctx context.Context, model *ups.Model) (string, bool) {
 	if e.UPS == nil {
@@ -416,13 +521,6 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 		return audit.OutcomeSkipped, nil
 	}
 	switch s.Action {
-	case plan.ActionUPSDeadline:
-		if e.Deadline == nil {
-			return audit.OutcomeSkipped, nil
-		}
-		if err := e.Deadline.Arm(ctx, s.Timeout); err != nil {
-			return audit.OutcomeFailed, err
-		}
 	case plan.ActionCephNoout:
 		if e.Ceph == nil {
 			return audit.OutcomeSkipped, nil
@@ -451,6 +549,13 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 		if err := e.Hyp.Shutdown(ctx, s.Target, s.Timeout); err != nil {
 			return audit.OutcomeFailed, err
 		}
+	case plan.ActionUPSCut:
+		if e.Cutter == nil {
+			return audit.OutcomeSkipped, nil
+		}
+		if err := e.Cutter.Cut(ctx, s.After); err != nil {
+			return audit.OutcomeFailed, err
+		}
 	case plan.ActionHostHalt:
 		if e.Host == nil {
 			return audit.OutcomeSkipped, nil
@@ -468,33 +573,9 @@ func (e *Executor) perform(ctx context.Context, s plan.Step) (string, error) {
 // run actually performed — a noout an operator set for maintenance is not ours
 // to clear.
 func (e *Executor) reverse(ctx context.Context, done []plan.Step, rec Recorder, gate string) int {
-	// The armed UPS deadline is cancelled before anything else. It is a timer
-	// the hardware already holds: leaving it standing while guests are restarted
-	// would cut power to a recovered estate a few minutes later, which is the
-	// outage this abort exists to prevent.
 	n := 0
-	for _, s := range done {
-		if s.Action == plan.ActionUPSDeadline && e.Deadline != nil {
-			idx := rec.StepStart(string(s.Action)+".undo", "", gate)
-			var err error
-			if !e.DryRun {
-				err = e.Deadline.Cancel(ctx)
-			}
-			if err != nil {
-				rec.StepEnd(idx, audit.OutcomeFailed, err)
-			} else {
-				rec.StepEnd(idx, audit.OutcomeDone, nil)
-				n++
-			}
-			break
-		}
-	}
-
 	for i := len(done) - 1; i >= 0; i-- {
 		s := done[i]
-		if s.Action == plan.ActionUPSDeadline {
-			continue // already cancelled above
-		}
 		if s.Action == plan.ActionK8sCordon {
 			if e.Kube == nil {
 				continue
@@ -553,11 +634,6 @@ func (e *Executor) undoFor(a plan.Action) func(context.Context) error {
 	switch a {
 	case plan.ActionGuestStop:
 		return nil // handled per-target in reverse, which knows which guest
-	case plan.ActionUPSDeadline:
-		if e.Deadline == nil {
-			return nil
-		}
-		return e.Deadline.Cancel
 	case plan.ActionCephNoout:
 		if e.Ceph == nil {
 			return nil

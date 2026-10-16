@@ -43,6 +43,7 @@ type Run struct {
 	ID       string
 	Host     string
 	Trigger  string
+	Verb     string // empty for runs recorded before verbs were
 	Started  time.Time
 	Duration time.Duration
 	Complete bool
@@ -91,6 +92,7 @@ func parseRuns(text string) []Run {
 		switch l.Event {
 		case evRunStart:
 			r.Started = when
+			r.Verb = l.Verb
 		case evStepStart:
 			for len(r.Steps) <= l.Step {
 				r.Steps = append(r.Steps, Step{})
@@ -142,4 +144,32 @@ func (r Run) WasCut() bool {
 		}
 	}
 	return r.Duration == 0
+}
+
+// episodeGap is how far apart two runs may start and still belong to one event:
+// a conserve, the sleep that follows it, and the unit's own sleep at poweroff.
+const episodeGap = 20 * time.Minute
+
+// Episode returns the newest run and the runs that led up to it, newest first.
+// runs must be ordered newest first, as LoadRuns returns them.
+//
+// Undoing only the newest run misses a conserve that stopped guests before a
+// sleep took over, and those guests would stay down after mains returned.
+//
+// A cancel or wake ends the episode before it: those runs are already undone.
+// An aborted run reversed itself and is left out.
+func Episode(runs []Run) []Run {
+	var out []Run
+	for i, r := range runs {
+		if r.Verb == VerbCancel || r.Verb == VerbWake {
+			break
+		}
+		if i > 0 && runs[i-1].Started.Sub(r.Started) > episodeGap {
+			break
+		}
+		if !r.Aborted {
+			out = append(out, r)
+		}
+	}
+	return out
 }

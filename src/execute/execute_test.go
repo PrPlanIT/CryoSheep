@@ -61,11 +61,6 @@ func (f *fakeCeph) UnsetNoout(context.Context) error { f.unset++; return nil }
 
 type fakeHost struct{ halted int }
 
-type fakeDeadline struct{ armed, cancelled int }
-
-func (f *fakeDeadline) Arm(context.Context, time.Duration) error { f.armed++; return nil }
-func (f *fakeDeadline) Cancel(context.Context) error             { f.cancelled++; return nil }
-
 func (f *fakeHost) Poweroff(context.Context) error { f.halted++; return nil }
 
 type recStep struct {
@@ -291,20 +286,18 @@ func TestNoGateNeverConsultsTheUPS(t *testing.T) {
 // while the third of six guests is stopping. Completing the shutdown would turn
 // a recovered outage into a real one.
 func TestMainsReturningMidGuestsAbandonsAndRestarts(t *testing.T) {
-	hyp, host, dl, rec := &fakeHyp{}, &fakeHost{}, &fakeDeadline{}, &recorder{}
-	// on battery for the deadline, noout and the first two guests; mains back at
-	// the third.
+	hyp, host, rec := &fakeHyp{}, &fakeHost{}, &recorder{}
+	// on battery for noout and the first two guests; mains back at the third.
 	ups := &fakeUPS{statuses: []string{
-		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnBattery,
-		core.StatusOnBattery, core.StatusOnline,
+		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
 	}}
 	p := plan.Build("avocado",
 		[]core.Role{core.RoleProxmox, core.RoleCephOSD},
 		[]core.Guest{
 			{ID: "1", Status: "running"}, {ID: "2", Status: "running"}, {ID: "3", Status: "running"},
 		},
-		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
-	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups, Deadline: dl, Record: rec}
+		core.StatusOnBattery, plan.Options{})
+	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups, Record: rec}
 
 	res := e.Run(context.Background(), p)
 	if !res.Aborted {
@@ -316,41 +309,13 @@ func TestMainsReturningMidGuestsAbandonsAndRestarts(t *testing.T) {
 	if len(hyp.started) != len(hyp.stopped) {
 		t.Fatalf("stopped %v but restarted %v — guests were left down", hyp.stopped, hyp.started)
 	}
-	if dl.cancelled != 1 {
-		t.Fatalf("UPS deadline cancelled %d times; a standing timer cuts power to a recovered estate", dl.cancelled)
-	}
-}
-
-// The deadline must be cancelled before guests are restarted: it is a timer the
-// hardware already holds, and it does not wait for the tidying up.
-func TestDeadlineIsCancelledBeforeGuestsAreRestarted(t *testing.T) {
-	rec := &recorder{}
-	ups := &fakeUPS{statuses: []string{
-		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
-	}}
-	p := plan.Build("h", []core.Role{core.RoleProxmox},
-		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
-		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
-	e := &Executor{Hyp: &fakeHyp{}, Ceph: &fakeCeph{}, Host: &fakeHost{},
-		UPS: ups, Deadline: &fakeDeadline{}, Record: rec}
-	_ = e.Run(context.Background(), p)
-
-	var undoOrder []string
-	for _, s := range rec.steps {
-		if len(s.action) > 5 && s.action[len(s.action)-5:] == ".undo" {
-			undoOrder = append(undoOrder, s.action)
-		}
-	}
-	if len(undoOrder) == 0 || undoOrder[0] != string(plan.ActionUPSDeadline)+".undo" {
-		t.Fatalf("undo order = %v, want the deadline cancelled first", undoOrder)
-	}
 }
 
 // Only the halt truly commits the host now.
 func TestOnlyTheHaltIsIrreversible(t *testing.T) {
 	p := plan.Build("h", []core.Role{core.RoleProxmox, core.RoleCephOSD},
 		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
-		core.StatusOnBattery, plan.Options{UPSDeadline: time.Minute})
+		core.StatusOnBattery, plan.Options{})
 	pnr := p.PointOfNoReturn()
 	if pnr != len(p.Steps)-1 {
 		t.Fatalf("point of no return at %d of %d; everything before the halt should be reversible",
@@ -384,16 +349,16 @@ func TestOperatorRequestedSleepIgnoresHealthyPower(t *testing.T) {
 // A power-loss sleep is conditional: mains returning removes the reason, so it
 // abandons and puts back what it took down.
 func TestPowerLossSleepAbandonsWhenTheReasonIsGone(t *testing.T) {
-	hyp, host, dl := &fakeHyp{}, &fakeHost{}, &fakeDeadline{}
+	hyp, host := &fakeHyp{}, &fakeHost{}
 	ups := &fakeUPS{statuses: []string{
-		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
+		core.StatusOnBattery, core.StatusOnBattery, core.StatusOnline,
 	}}
 	p := plan.Build("avocado", []core.Role{core.RoleProxmox, core.RoleCephOSD},
 		[]core.Guest{{ID: "1", Status: "running"}, {ID: "2", Status: "running"}},
-		core.StatusOnBattery, plan.Options{UPSDeadline: 5 * time.Minute})
+		core.StatusOnBattery, plan.Options{})
 
 	// NoGate unset: this is the power-loss path.
-	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups, Deadline: dl}
+	e := &Executor{Hyp: hyp, Ceph: &fakeCeph{}, Host: host, UPS: ups}
 	res := e.Run(context.Background(), p)
 
 	if !res.Aborted || host.halted != 0 {
@@ -401,9 +366,6 @@ func TestPowerLossSleepAbandonsWhenTheReasonIsGone(t *testing.T) {
 	}
 	if len(hyp.started) != len(hyp.stopped) {
 		t.Fatalf("stopped %v, restarted %v", hyp.stopped, hyp.started)
-	}
-	if dl.cancelled != 1 {
-		t.Fatalf("deadline cancelled %d times, want 1", dl.cancelled)
 	}
 }
 
@@ -548,7 +510,7 @@ func TestAWaveRunsItsStepsConcurrently(t *testing.T) {
 // it, and parallelism only fixes that if the executor bounds each step.
 func TestAHangingGuestDoesNotStarveItsWaveMates(t *testing.T) {
 	h := newConcurrentHyp("2")
-	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true}
+	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true, ForceStopGrace: time.Nanosecond}
 
 	done := make(chan Result, 1)
 	go func() {
@@ -579,7 +541,7 @@ func TestAHangingGuestDoesNotStarveItsWaveMates(t *testing.T) {
 func TestAHungGuestIsRecordedAsFailedNotDone(t *testing.T) {
 	h := newConcurrentHyp("2")
 	rec := &recorder{}
-	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true, Record: rec}
+	e := &Executor{Hyp: h, Host: &fakeHost{}, NoGate: true, Record: rec, ForceStopGrace: time.Nanosecond}
 	e.Run(context.Background(), waveOfGuests([]string{"1", "2", "3"}, 100*time.Millisecond))
 
 	var failed int
@@ -604,7 +566,7 @@ func TestHoldUntilDelaysTheFirstCommittingStep(t *testing.T) {
 		Hyp: &fakeHyp{}, Host: &fakeHost{}, NoGate: true,
 		Clock: func() time.Time { return now },
 		After: func(d time.Duration) <-chan time.Time {
-			waited = d
+			waited += d
 			ch := make(chan time.Time, 1)
 			ch <- now
 			return ch

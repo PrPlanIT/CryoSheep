@@ -131,10 +131,14 @@ func Feasible(r Recommendation, runtimeNow time.Duration) (bool, string) {
 
 // FromAudit converts runs reconstructed from the journal into the shape
 // calibration works on. Calibration itself stays pure — it is handed a slice and
-// never learns where the slice came from.
+// never learns where the slice came from. Only sleeps are timed; a shed or an
+// undo is not a shutdown.
 func FromAudit(rs []audit.Run) []Run {
 	out := make([]Run, 0, len(rs))
 	for _, r := range rs {
+		if r.Verb != audit.VerbSleep && r.Verb != "" {
+			continue
+		}
 		out = append(out, Run{
 			ID: r.ID, Host: r.Host, Started: r.Started,
 			Duration: r.Duration, Complete: r.Complete,

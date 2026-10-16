@@ -23,7 +23,7 @@ func write(t *testing.T, f func(*Log)) (string, int) {
 	t.Helper()
 	var buf bytes.Buffer
 	syncs := 0
-	l := open(&buf, func() error { syncs++; return nil }, clock(time.Second), "host-a", TriggerUPS)
+	l := open(&buf, func() error { syncs++; return nil }, clock(time.Second), "host-a", TriggerUPS, "")
 	f(l)
 	return buf.String(), syncs
 }
@@ -125,7 +125,7 @@ func TestRunsComeBackNewestFirst(t *testing.T) {
 	base := time.Date(2026, 9, 17, 3, 0, 0, 0, time.UTC)
 	for i, h := range []string{"older", "newer"} {
 		at := base.Add(time.Duration(i) * time.Hour)
-		l := open(&buf, nil, func() time.Time { t := at; at = at.Add(time.Second); return t }, h, TriggerUPS)
+		l := open(&buf, nil, func() time.Time { t := at; at = at.Add(time.Second); return t }, h, TriggerUPS, "")
 		_ = l.Close(true, false)
 	}
 	runs := parseRuns(buf.String())
@@ -165,7 +165,7 @@ func TestShellStartedRunAlsoReachesTheJournal(t *testing.T) {
 	t.Setenv("JOURNAL_STREAM", "")
 
 	var term, journal bytes.Buffer
-	l := open(io.MultiWriter(&term, &journal), nil, clock(time.Second), "host-a", TriggerManual)
+	l := open(io.MultiWriter(&term, &journal), nil, clock(time.Second), "host-a", TriggerManual, "")
 	i := l.StepStart("k8s.cordon", "host-a", "")
 	l.StepEnd(i, OutcomeDone, nil)
 	_ = l.Close(true, false)
@@ -186,7 +186,7 @@ func TestShellStartedRunAlsoReachesTheJournal(t *testing.T) {
 // shutdown should not have to parse what they are watching.
 func TestTerminalGetsProseAndTheJournalGetsJSON(t *testing.T) {
 	var journal, term bytes.Buffer
-	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd)
+	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd, "")
 	l.human = &term
 	i := l.StepStart("k8s.cordon", "host-a", "")
 	l.StepEnd(i, OutcomeDone, nil)
@@ -208,12 +208,64 @@ func TestTerminalGetsProseAndTheJournalGetsJSON(t *testing.T) {
 // Under systemd stderr is the journal, so prose there would corrupt the record.
 func TestNoProseWhenStderrIsTheJournal(t *testing.T) {
 	var journal bytes.Buffer
-	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd)
+	l := open(&journal, nil, clock(time.Second), "host-a", TriggerSystemd, "")
 	i := l.StepStart("k8s.cordon", "host-a", "")
 	l.StepEnd(i, OutcomeDone, nil)
 	for _, ln := range strings.Split(strings.TrimSpace(journal.String()), "\n") {
 		if !strings.HasPrefix(ln, "{") {
 			t.Fatalf("non-JSON line in the record: %q", ln)
 		}
+	}
+}
+
+// A conserve, the sleep that followed it, and the unit's own sleep at poweroff
+// are one event; an older run is not part of it.
+func TestEpisodeGroupsRunsOfOneEvent(t *testing.T) {
+	at := time.Date(2026, 10, 15, 3, 0, 0, 0, time.UTC)
+	runs := []Run{
+		{ID: "unit-sleep", Started: at.Add(4 * time.Minute)},
+		{ID: "ups-sleep", Started: at.Add(2 * time.Minute)},
+		{ID: "conserve", Started: at},
+		{ID: "last-week", Started: at.Add(-7 * 24 * time.Hour)},
+	}
+	got := Episode(runs)
+	if len(got) != 3 || got[2].ID != "conserve" {
+		t.Fatalf("Episode = %v, want the three runs of this event", got)
+	}
+	if Episode(nil) != nil {
+		t.Fatal("no runs is no episode")
+	}
+}
+
+// Both endpoints report ONLINE, so cancel runs twice; the second finds the first.
+func TestEpisodeEndsAtAnUndo(t *testing.T) {
+	at := time.Date(2026, 10, 15, 3, 0, 0, 0, time.UTC)
+	runs := []Run{
+		{ID: "cancel", Verb: VerbCancel, Started: at.Add(time.Minute)},
+		{ID: "conserve", Verb: VerbConserve, Started: at},
+	}
+	if got := Episode(runs); len(got) != 0 {
+		t.Fatalf("Episode = %v, want nothing after a cancel", got)
+	}
+
+	runs = []Run{
+		{ID: "conserve-2", Verb: VerbConserve, Started: at.Add(30 * time.Minute)},
+		{ID: "wake", Verb: VerbWake, Started: at.Add(25 * time.Minute)},
+		{ID: "sleep", Verb: VerbSleep, Started: at},
+	}
+	if got := Episode(runs); len(got) != 1 || got[0].ID != "conserve-2" {
+		t.Fatalf("Episode = %v, want only the run after the wake", got)
+	}
+}
+
+// A sleep that abandoned already reversed its own steps.
+func TestEpisodeSkipsAbortedRuns(t *testing.T) {
+	at := time.Date(2026, 10, 15, 3, 0, 0, 0, time.UTC)
+	runs := []Run{
+		{ID: "sleep", Verb: VerbSleep, Aborted: true, Started: at.Add(2 * time.Minute)},
+		{ID: "conserve", Verb: VerbConserve, Started: at},
+	}
+	if got := Episode(runs); len(got) != 1 || got[0].ID != "conserve" {
+		t.Fatalf("Episode = %v, want the conserve only", got)
 	}
 }

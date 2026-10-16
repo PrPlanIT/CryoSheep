@@ -53,7 +53,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `cryosheep — put a machine into stasis, and bring it back
 
   plan       show what would happen here, changing nothing
-  conserve   shed load and hold, reversibly        (upsmon NOTIFYCMD, ONBATT)
+  conserve   stop guests tagged shed, reversibly  (upssched, once the outage is confirmed)
   sleep      put this machine into stasis         (upsmon SHUTDOWNCMD / systemd)
              a UPS-triggered sleep abandons if mains return; a requested one does not
   cancel     abandon a sleep and undo it          (upsmon NOTIFYCMD, ONLINE)
@@ -68,6 +68,8 @@ func runPlan(args []string) int {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	var f runFlags
 	f.bind(fs)
+	fs.BoolVar(&f.asPowerLoss, "power-loss", false,
+		"plan as though the UPS reported a power failure, with the order groups and holds a power event uses")
 	_ = fs.Parse(args)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -142,9 +144,15 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 
 	// A plan that will wait should say so before it is trusted: a barrier is the
 	// difference between halting when ready and halting when everyone is.
+	for i, s := range p.Steps {
+		if s.NotBefore > 0 && (i == 0 || p.Steps[i-1].Wave != s.Wave) {
+			fmt.Printf("\nhold:    step %d waits until %s from the start, or until no guest in orders %s\n"+
+				"         is running anywhere in the estate, whichever is first\n", i+1, s.NotBefore, spans(s.Clears))
+		}
+	}
 	if p.HoldUntil > 0 {
-		fmt.Printf("\nbarrier: the first committing step waits until %s from the start,\n"+
-			"         so hosts acting on one signal stop together rather than as each finishes\n", p.HoldUntil)
+		fmt.Printf("\nbarrier: the first committing step waits until %s from the start, or until no\n"+
+			"         guest is running anywhere, so hosts acting on one signal stop together\n", p.HoldUntil)
 	}
 	if pnr < len(p.Steps) {
 		fmt.Printf("\npoint of no return: step %d — power returning before it aborts and reverses\n", pnr+1)
@@ -156,7 +164,7 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 	// rebooting and a second poweroff would turn a reboot into a dark machine.
 	for _, st := range p.Steps {
 		if st.Action == plan.ActionHostHalt {
-			fmt.Println("under systemd: host.poweroff is omitted — systemd is already stopping the machine")
+			fmt.Println("under systemd: host.poweroff and the UPS cut are omitted — systemd is already stopping the machine")
 			break
 		}
 	}
@@ -200,7 +208,7 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 		fmt.Println(line)
 		if runtime > 0 && worst > runtime {
 			fmt.Printf("  WARNING: the sequence cannot complete at this load — %s short.\n"+
-				"  shorten the guests' down=, stop non-critical guests earlier, or rely on the UPS deadline.\n",
+				"  shorten the guests' down=, tag non-critical guests shed, or commit earlier.\n",
 				worst-runtime)
 		}
 		// The battery is not the only bound, and on a host with no UPS of its own
@@ -210,7 +218,7 @@ func render(p plan.Plan, runtime, defaultBudget time.Duration) {
 		if worst > sequenceTimeout {
 			fmt.Printf("  WARNING: worst case exceeds this run's own budget of %s by %s.\n"+
 				"  the sequence would be cut short mid-step; raise the guests' down= discipline\n"+
-				"  or accept that the last wave relies on the deadline rather than finishing.\n",
+				"  or accept that the last wave relies on the armed UPS cut rather than finishing.\n",
 				sequenceTimeout, worst-sequenceTimeout)
 		}
 	}
@@ -277,4 +285,20 @@ func runCalibrate(args []string) int {
 		}
 	}
 	return 0
+}
+
+// spans renders order ranges as "4-99, 5".
+func spans(groups []plan.OrderGroup) string {
+	out := ""
+	for i, g := range groups {
+		if i > 0 {
+			out += ", "
+		}
+		if g.Lo == g.Hi {
+			out += fmt.Sprint(g.Lo)
+		} else {
+			out += fmt.Sprintf("%d-%d", g.Lo, g.Hi)
+		}
+	}
+	return out
 }

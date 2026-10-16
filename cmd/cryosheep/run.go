@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"github.com/PrPlanIT/CryoSheep/src/adapters/remote"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/PrPlanIT/CryoSheep/src/adapters/exec"
@@ -49,8 +51,7 @@ const sequenceTimeout = 6 * time.Minute
 // Proxmox, and why we are stopping is read from the environment rather than
 // declared. A flag that can contradict the truth is worse than no flag at all.
 type runFlags struct {
-	dryRun      bool
-	upsDeadline time.Duration
+	dryRun bool
 
 	// guestConcurrency is how many of a host's guests may stop at once, and
 	// holdUntil is how long to wait before the first step that cannot be undone.
@@ -58,6 +59,10 @@ type runFlags struct {
 	// an environment default the unit file can carry.
 	guestConcurrency int
 	holdUntil        time.Duration
+
+	// upsCut is the delay sent with shutdown.return before the halt of a power
+	// event; 0 sends nothing.
+	upsCut time.Duration
 
 	// orderGroups names spans of startup order that stop together, so a power
 	// failure can use the estate's real dependency shape rather than its finer
@@ -70,6 +75,10 @@ type runFlags struct {
 
 	// trigger is detected, not parsed — see detectTrigger.
 	trigger string
+
+	// asPowerLoss plans as though power were the reason, so `plan` can show the
+	// power-event shape on an ordinary day.
+	asPowerLoss bool
 }
 
 // kubeletConf is the node's own kubelet identity. A kubelet may patch its own
@@ -103,19 +112,20 @@ func (f *runFlags) bind(fs *flag.FlagSet) {
 	f.trigger = detectTrigger()
 	fs.BoolVar(&f.dryRun, "dry-run", false,
 		"walk and record the decisions without performing them")
-	fs.DurationVar(&f.upsDeadline, "ups-deadline", envDuration("CRYOSHEEP_UPS_DEADLINE"),
-		"when the UPS cuts power regardless of the sequence; 0 disables")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "",
 		"identity for kubectl; defaults to $CRYOSHEEP_KUBECONFIG, $KUBECONFIG, then "+kubeletConf)
 	fs.IntVar(&f.guestConcurrency, "guest-concurrency", envInt("CRYOSHEEP_GUEST_CONCURRENCY"),
 		"how many guests may stop at once; 1 one at a time, -1 all of a tier together, 0 takes the default (1)")
 	fs.StringVar(&f.orderGroups, "order-groups", os.Getenv("CRYOSHEEP_ORDER_GROUPS"),
-		"startup-order ranges that stop together, in sequence, e.g. \"5-99,4,2-3,1\"; empty keeps every tier its own wave")
+		"startup-order ranges that stop together, in sequence; @d holds a range until d from the start or until no earlier range runs anywhere, e.g. \"4-99,1-3@4m30s\"; empty keeps every tier its own wave")
 	fs.DurationVar(&f.holdUntil, "hold-until", envDuration("CRYOSHEEP_HOLD_UNTIL"),
 		"wait this long from the start before the first step that cannot be undone, so hosts commit together; 0 disables")
+	fs.DurationVar(&f.upsCut, "ups-cut", envDuration("CRYOSHEEP_UPS_CUT"),
+		"on a power event, send shutdown.return with this delay just before the halt; 0 sends nothing")
 }
 
-// parseOrderGroups reads "5-99,4,2-3,1" into the ranges that stop together.
+// parseOrderGroups reads "4-99,1-3@4m30s" into the ranges that stop together.
+// A range suffixed "@d" may not start before d from the start of the run.
 //
 // A malformed value yields nothing rather than something partial, because a
 // partial grouping is a guest left out of the sequence. The planner discards
@@ -129,18 +139,24 @@ func parseOrderGroups(spec string) []plan.OrderGroup {
 	var out []plan.OrderGroup
 	for _, part := range strings.Split(spec, ",") {
 		part = strings.TrimSpace(part)
-		lo, hi, found := strings.Cut(part, "-")
+		span, at, held := strings.Cut(part, "@")
+		var notBefore time.Duration
+		var errD error
+		if held {
+			notBefore, errD = time.ParseDuration(strings.TrimSpace(at))
+		}
+		lo, hi, found := strings.Cut(span, "-")
 		if !found {
 			hi = lo
 		}
 		l, errL := strconv.Atoi(strings.TrimSpace(lo))
 		h, errH := strconv.Atoi(strings.TrimSpace(hi))
-		if errL != nil || errH != nil || l > h || l < 1 {
+		if errL != nil || errH != nil || errD != nil || l > h || l < 1 || notBefore < 0 {
 			fmt.Fprintf(os.Stderr,
 				"warning: order-groups %q is malformed at %q, ignoring the whole value\n", spec, part)
 			return nil
 		}
-		out = append(out, plan.OrderGroup{Lo: l, Hi: h})
+		out = append(out, plan.OrderGroup{Lo: l, Hi: h, NotBefore: notBefore})
 	}
 	return out
 }
@@ -191,42 +207,58 @@ func envDuration(key string) time.Duration {
 // whether to abandon — so both decisions now come from one source that cannot
 // disagree with itself.
 //
-// An unreadable UPS reads false, which is the honest answer rather than a
-// pessimistic one: without it there is no way to observe mains returning, so
-// there is nothing to gate on either way.
-func powerIsTheReason(status string) bool {
+// An unreadable UPS reads false, unless upsmon launched us: it runs SHUTDOWNCMD
+// only on a power decision, and the endpoints can be gone by the time we read
+// them. Planning that run as a plain stop drops the holds that keep the routers
+// up for every other host.
+func powerIsTheReason(status, trigger string) bool {
+	if status == "" || status == "unknown" {
+		return trigger == audit.TriggerUPS
+	}
 	return nut.Flag(status, core.StatusOnBattery) || nut.Flag(status, core.StatusFSD)
 }
 
 // detectTrigger establishes why this run is happening, from the environment of
 // whatever started it.
 //
-// Read rather than declared. The caller already knows — upsmon exports
-// NOTIFYTYPE, systemd exports INVOCATION_ID — and asking it to say so again only
-// creates a way for it to say something untrue. Whether power returning matters
-// depends on this answer, so being told the wrong one is not survivable.
+// Read rather than declared. The caller already knows, and asking it to say so
+// again only creates a way for it to say something untrue. Whether the halt is
+// ours to perform depends on this answer, so being told the wrong one is not
+// survivable.
+//
+// systemd passes SERVICE_RESULT only to ExecStop and ExecStopPost, so it marks
+// exactly the stasis unit being stopped. INVOCATION_ID does not: every child of
+// any service inherits it, including upsmon's SHUTDOWNCMD, which reading it as
+// "systemd is stopping us" turned into a run that did nothing. A child of a
+// service that is not our ExecStop is upsmon.
 func detectTrigger() string {
 	switch {
-	case os.Getenv("NOTIFYTYPE") != "":
-		return audit.TriggerUPS
-	case os.Getenv("INVOCATION_ID") != "":
+	case os.Getenv("SERVICE_RESULT") != "":
 		return audit.TriggerSystemd
+	case os.Getenv("NOTIFYTYPE") != "", os.Getenv("INVOCATION_ID") != "":
+		return audit.TriggerUPS
 	default:
 		return audit.TriggerManual
 	}
 }
 
-// upsFor opens a client from what NUT already records on this host. A machine
+// upsFor opens every upsd endpoint NUT already records on this host. A machine
 // with no upsmon.conf has no UPS, which is correct for a guest: it is told to
 // stop by something else and simply stops well.
-func upsFor() (*nut.Client, bool) {
-	m, ok := nut.ReadMonitor(nut.UpsmonConf)
-	if !ok || m.Addr == "" {
+func upsFor() (nut.Endpoints, bool) {
+	ms, ok := nut.ReadMonitors(nut.UpsmonConf)
+	if !ok {
 		return nil, false
 	}
-	c := nut.New(m.Addr, m.Name)
-	c.User, c.Pass = m.User, m.Pass
-	return c, true
+	var e nut.Endpoints
+	for _, m := range ms {
+		if m.Addr != "" {
+			c := nut.New(m.Addr, m.Name)
+			c.User, c.Pass = m.User, m.Pass
+			e = append(e, c)
+		}
+	}
+	return e, len(e) > 0
 }
 
 // build assembles the plan and the executor for this host.
@@ -276,46 +308,54 @@ func (f *runFlags) build(ctx context.Context) (plan.Plan, *execute.Executor, *ex
 
 	status := "unknown"
 	var ups core.UPS
-	var deadline core.Deadline
+	var cutter core.Cutter
 	if c, ok := upsFor(); ok {
-		ups = c
+		ups, cutter = c, c
 		if r, err := c.Read(ctx); err == nil {
 			status = r.Status
 		} else {
 			fmt.Fprintf(os.Stderr, "warning: could not read UPS: %v\n", err)
 		}
-		// The backstop needs an authenticated user; without one the deadline
-		// step is planned but skipped, and the run records that it was.
-		if c.User != "" && c.Pass != "" {
-			deadline = c
-		}
 	}
 
+	powerLoss := powerIsTheReason(status, f.trigger)
 	opts := plan.Options{
 		GuestTimeout:     guestFallback,
-		UPSDeadline:      f.upsDeadline,
 		GuestConcurrency: f.guestConcurrency,
-		OrderGroups:      parseOrderGroups(f.orderGroups),
-		HoldUntil:        f.holdUntil,
 		// systemd invoked us from a unit it is already stopping, so the poweroff
 		// or reboot is in flight. Halting on top of that turns a reboot into a
 		// poweroff — a node patched by ansible would never come back.
 		OmitHalt: f.trigger == audit.TriggerSystemd,
 	}
+	// Grouping and holds are policy for a power event, when every host acts on
+	// one signal. A host stopped on its own — a reboot, maintenance — keeps the
+	// careful per-tier shape and waits on nobody: the rest of the estate is still
+	// running, so a hold on it would only ever run to its ceiling.
+	if powerLoss || f.asPowerLoss {
+		opts.OrderGroups = parseOrderGroups(f.orderGroups)
+		opts.HoldUntil = f.holdUntil
+		opts.UPSCut = f.upsCut
+	}
 	p := plan.Build(host, roles, guests, status, opts)
-	e := &execute.Executor{Hyp: hyp, UPS: ups, Ceph: runner, Kube: runner, Host: halt,
-		Deadline: deadline, DryRun: f.dryRun, PowerLoss: powerIsTheReason(status)}
+	e := &execute.Executor{Hyp: hyp, UPS: ups, Ceph: runner, Kube: runner, Host: halt, Cutter: cutter,
+		DryRun: f.dryRun, PowerLoss: powerLoss}
 	if _, _, remote := remoteTarget(); remote {
 		// Nothing local is being stopped, so the collaborators that act on this
 		// machine are dropped rather than left pointing at it.
 		e.Ceph, e.Kube = nil, nil
+	} else {
+		for _, r := range roles {
+			if r == core.RoleProxmox {
+				e.Estate = runner
+			}
+		}
 	}
 	return p, e, runner
 }
 
 // remoteTarget builds a hypervisor for a machine CryoSheep is not running on.
 //
-// Environment rather than flags for the same reason the UPS deadline is: it is
+// Environment rather than flags for the same reason the order groups are: it is
 // per-host configuration that belongs in a unit file ansible manages, not an
 // argument repeated at every call site. All four must be present — a partial
 // configuration is a mistake, and falling back to the local machine silently
@@ -340,9 +380,10 @@ func remoteTarget() (*remote.Proxmox, string, bool) {
 	}, node, true
 }
 
-// runConserve performs only the reversible prefix — what can be given back if
-// mains return. Invoked from upsmon's NOTIFYCMD on ONBATT, while the budget is
-// still abundant and nothing has been committed.
+// runConserve stops this host's guests tagged shed, and nothing else — what can
+// be given back if mains return. Invoked once an outage is confirmed (upssched,
+// after the linger), while the budget is still abundant and nothing has been
+// committed.
 func runConserve(args []string) int {
 	fs := flag.NewFlagSet("conserve", flag.ExitOnError)
 	var f runFlags
@@ -352,14 +393,16 @@ func runConserve(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	p, e, _ := f.build(ctx)
-	p.Steps = p.Steps[:p.PointOfNoReturn()] // reversible prefix only
+	defer lockUndo()()
+
+	full, e, _ := f.build(ctx)
+	p := plan.Shed(full.Host, full.Guests, full.UPSStatus, plan.Options{GuestTimeout: guestFallback})
 	if len(p.Steps) == 0 {
-		fmt.Println("nothing to conserve on this host")
+		fmt.Println("nothing to conserve on this host: no running guest is tagged " + core.TagShed)
 		return 0
 	}
 
-	w := audit.Open(p.Host, audit.TriggerUPS)
+	w := audit.Open(p.Host, audit.TriggerUPS, audit.VerbConserve)
 	e.Record = w
 
 	res := e.Run(ctx, p)
@@ -388,16 +431,78 @@ func runCancel(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	runs, err := audit.LoadRuns(ctx)
-	if err != nil || len(runs) == 0 {
+	defer lockUndo()()
+	// A sequence still running abandons and reverses itself on mains; undoing
+	// its unfinished run here as well would start the same guests twice.
+	if unlock, ok := lockSleep(true); ok {
+		defer unlock()
+	}
+
+	runs, _ := audit.LoadRuns(ctx)
+	ep := audit.Episode(runs)
+	if len(ep) == 0 {
 		fmt.Println("cancel: no run to undo")
 		return 0
 	}
-	last := runs[0]
-
-	undone := undoRun(ctx, f, last)
-	fmt.Printf("cancel: undid %d step(s) from run %s\n", undone, last.ID)
+	for _, r := range ep {
+		fmt.Printf("cancel: undid %d step(s) from run %s\n", undoRun(ctx, f, r), r.ID)
+	}
+	recordUndo(f, audit.VerbCancel)
 	return 0
+}
+
+// lockUndo serialises conserve, cancel and wake on this host. Every endpoint
+// reports each transition, so upssched runs each of them once per endpoint.
+// It returns the unlock.
+func lockUndo() func() {
+	for _, p := range []string{"/run/cryosheep.lock", filepath.Join(os.TempDir(), "cryosheep.lock")} {
+		fd, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			continue
+		}
+		if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX); err != nil {
+			fd.Close()
+			continue
+		}
+		return func() { fd.Close() }
+	}
+	fmt.Fprintln(os.Stderr, "warning: no lock; running unserialised")
+	return func() {}
+}
+
+// lockSleep takes this host's sequence lock. Without wait, ok is false only
+// when another sequence holds it; a lock that cannot be opened at all does not
+// stop a shutdown.
+func lockSleep(wait bool) (func(), bool) {
+	how := syscall.LOCK_EX | syscall.LOCK_NB
+	if wait {
+		how = syscall.LOCK_EX
+	}
+	for _, p := range []string{"/run/cryosheep-sleep.lock", filepath.Join(os.TempDir(), "cryosheep-sleep.lock")} {
+		fd, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			continue
+		}
+		if err := syscall.Flock(int(fd.Fd()), how); err != nil {
+			fd.Close()
+			if err == syscall.EWOULDBLOCK {
+				return nil, false
+			}
+			continue
+		}
+		return func() { fd.Close() }, true
+	}
+	fmt.Fprintln(os.Stderr, "warning: no sequence lock; running unserialised")
+	return func() {}, true
+}
+
+// recordUndo marks the episode undone, so the next cancel or wake leaves it.
+func recordUndo(f runFlags, verb string) {
+	if f.dryRun {
+		return
+	}
+	host, _ := os.Hostname()
+	_ = audit.Open(host, f.trigger, verb).Close(true, false)
 }
 
 // runSleep performs the whole sequence. Invoked from upsmon's SHUTDOWNCMD, and
@@ -426,6 +531,23 @@ func runSleep(args []string) int {
 		return 0
 	}
 
+	// The UPS asked, and the UPS now reads mains present: the reason is gone
+	// before anything started. A plain stop here would halt with mains present
+	// and no cut to cycle the machine back on.
+	if f.trigger == audit.TriggerUPS && !e.PowerLoss && p.UPSStatus != "unknown" && p.UPSStatus != "" {
+		fmt.Printf("sleep: UPS reports %q — mains are back, nothing to do\n", p.UPSStatus)
+		return 0
+	}
+
+	// One sequence per host. The commit timer and the runtime floor can both
+	// start one.
+	unlock, ok := lockSleep(false)
+	if !ok {
+		fmt.Println("sleep: a sequence is already running on this host")
+		return 0
+	}
+	defer unlock()
+
 	// Why we are stopping decides whether power returning matters.
 	//
 	// A power-loss sleep is conditional: mains coming back means the reason is
@@ -435,7 +557,7 @@ func runSleep(args []string) int {
 	// that was requested, leaving guests running while the host stops under them.
 	e.NoGate = !e.PowerLoss
 
-	w := audit.Open(p.Host, f.trigger)
+	w := audit.Open(p.Host, f.trigger, audit.VerbSleep)
 	e.Record = w
 
 	res := e.Run(ctx, p)
@@ -471,20 +593,30 @@ func runWake(args []string) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	runs, err := audit.LoadRuns(ctx)
-	if err != nil || len(runs) == 0 {
+	defer lockUndo()()
+	if unlock, ok := lockSleep(true); ok {
+		defer unlock()
+	}
+
+	runs, _ := audit.LoadRuns(ctx)
+	ep := audit.Episode(runs)
+	if len(ep) == 0 {
 		fmt.Println("wake: nothing to revive")
 		return 0
 	}
 
-	last := runs[0]
+	last := ep[0]
 	how := "graceful"
 	if last.WasCut() {
 		how = "cut"
 	}
 	fmt.Printf("wake: reviving from run %s (%s) — previous stop was %s\n", last.ID, last.Trigger, how)
 
-	revived := undoRun(ctx, f, last)
+	revived := 0
+	for _, r := range ep {
+		revived += undoRun(ctx, f, r)
+	}
+	recordUndo(f, audit.VerbWake)
 	fmt.Printf("wake: undid %d action(s)\n", revived)
 	return 0
 }
@@ -495,7 +627,6 @@ func runWake(args []string) int {
 func undoRun(ctx context.Context, f runFlags, run audit.Run) int {
 	runner := exec.New()
 	runner.Kubeconfig = resolveKubeconfig(f.kubeconfig)
-	ups, _ := upsFor()
 
 	undone := 0
 	for i := len(run.Steps) - 1; i >= 0; i-- {
@@ -506,12 +637,6 @@ func undoRun(ctx context.Context, f runFlags, run audit.Run) int {
 		var undo func() error
 		var what string
 		switch s.Action {
-		case string(plan.ActionUPSDeadline):
-			// Most urgent: left standing, the UPS cuts power to a machine that
-			// has already come back.
-			if ups != nil {
-				undo, what = func() error { return ups.Cancel(ctx) }, "cancel UPS deadline"
-			}
 		case string(plan.ActionK8sCordon):
 			undo, what = func() error { return runner.Uncordon(ctx, s.Target) }, "uncordon "+s.Target
 		case string(plan.ActionGuestStop):

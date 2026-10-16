@@ -1,0 +1,24 @@
+[Unit]
+Description=CryoSheep %i on a UPS event
+Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+
+# Started by upsmon's SHUTDOWNCMD and upssched's CMDSCRIPT (`systemctl start
+# --no-block cryosheep@sleep.service`, @conserve, @cancel) rather than run by
+# them. upsmon exits once it has handed off SHUTDOWNCMD, and systemd then kills
+# what is left in nut-monitor's cgroup — a sequence started there would die with
+# it. A unit also runs one instance at a time: the commit timer and the
+# runtime.low floor both start @sleep, and the second start is a no-op.
+After=network-online.target pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/cryosheep %i
+
+# The sequence, not the start: oneshot defaults to 90s.
+TimeoutStartSec=420s
+
+# See cryosheep-stasis.service for what each of these does.
+Environment=CRYOSHEEP_GUEST_CONCURRENCY=-1
+Environment=CRYOSHEEP_ORDER_GROUPS=4-99,1-3@4m10s
+Environment=CRYOSHEEP_HOLD_UNTIL=5m30s
+Environment=CRYOSHEEP_UPS_CUT=45s

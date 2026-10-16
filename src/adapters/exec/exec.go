@@ -14,7 +14,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +35,9 @@ type Runner struct {
 	// cordoned — a silent no-op in the one path that has to work. Naming it here
 	// makes the dependency visible and its absence reportable.
 	Kubeconfig string
+
+	// ReadFile is swappable for the same reason as Run. Nil reads the disk.
+	ReadFile func(name string) ([]byte, error)
 }
 
 // kubectl builds an argument list with the kubeconfig in front, when one is
@@ -93,8 +98,104 @@ func (r *Runner) Guests(ctx context.Context) ([]core.Guest, error) {
 		}
 		guests[i].Order = ParseStartupOrder(string(cfg))
 		guests[i].Down = ParseStartupDown(string(cfg))
+		guests[i].Tags = ParseTags(string(cfg))
 	}
 	return guests, nil
+}
+
+// ParseTags reads `tags: a;b` from a guest config. Proxmox stores tags
+// separated by semicolons; commas and spaces are accepted on input too.
+func ParseTags(cfg string) []string {
+	sc := bufio.NewScanner(strings.NewReader(currentSection(cfg)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "tags:") {
+			continue
+		}
+		return strings.FieldsFunc(strings.TrimPrefix(line, "tags:"), func(r rune) bool {
+			return r == ';' || r == ',' || r == ' '
+		})
+	}
+	return nil
+}
+
+// currentSection drops snapshot sections from a raw guest config file. The live
+// configuration comes first; each `[snapshot]` after it repeats the same keys
+// with the values of that snapshot.
+func currentSection(cfg string) string {
+	if i := strings.Index(cfg, "\n["); i >= 0 {
+		return cfg[:i]
+	}
+	return cfg
+}
+
+// PVEConfDir is the cluster filesystem. Every node's guest configs are
+// replicated here over corosync, so another node's guests can be read locally.
+const PVEConfDir = "/etc/pve/nodes"
+
+// Running lists the running VMs on every node of the cluster, each with its
+// startup order. Implements core.Estate.
+//
+// Status comes from `pvesh get /cluster/resources`, served locally from the
+// cluster filesystem; each order from the replicated config file. Neither needs
+// a routed path. An empty listing is an error, not an empty cluster: a cluster
+// always lists its VMs, running or not, and reading silence as "nothing
+// running" would release a hold early.
+func (r *Runner) Running(ctx context.Context) ([]core.Guest, error) {
+	out, err := r.Run(ctx, "pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json")
+	if err != nil {
+		return nil, fmt.Errorf("pvesh /cluster/resources: %w", err)
+	}
+	listed, err := ParseClusterResources(out)
+	if err != nil {
+		return nil, err
+	}
+	read := r.ReadFile
+	if read == nil {
+		read = os.ReadFile
+	}
+	var running []core.Guest
+	for _, g := range listed {
+		if !g.Running() {
+			continue
+		}
+		// An unreadable config leaves the guest unordered, which is the latest
+		// group: it still holds back anything that waits on it.
+		if cfg, err := read(filepath.Join(PVEConfDir, g.Node, "qemu-server", g.ID+".conf")); err == nil {
+			g.Order = ParseStartupOrder(currentSection(string(cfg)))
+		}
+		running = append(running, g)
+	}
+	return running, nil
+}
+
+// ParseClusterResources reads the VMs from `pvesh get /cluster/resources
+// --type vm --output-format json`. Containers are left out: CryoSheep stops
+// only VMs, so a container it would never stop must not hold anything back.
+func ParseClusterResources(data []byte) ([]core.Guest, error) {
+	var rows []struct {
+		VMID   int    `json:"vmid"`
+		Name   string `json:"name"`
+		Node   string `json:"node"`
+		Status string `json:"status"`
+		Type   string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &rows); err != nil {
+		return nil, fmt.Errorf("pvesh /cluster/resources: %w", err)
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("pvesh /cluster/resources: empty listing")
+	}
+	var out []core.Guest
+	for _, r := range rows {
+		if r.Type != "qemu" {
+			continue
+		}
+		out = append(out, core.Guest{
+			ID: strconv.Itoa(r.VMID), Name: r.Name, Node: r.Node, Status: r.Status, Order: core.OrderUnset,
+		})
+	}
+	return out, nil
 }
 
 // ParseStartupDown reads `down=N` from a guest's startup line — the seconds

@@ -70,10 +70,12 @@ func (p *Proxmox) Guests(ctx context.Context) ([]core.Guest, error) {
 			// which puts a router in the same wave as the Kubernetes nodes that
 			// route through it.
 			order, down := core.OrderUnset, time.Duration(0)
+			var tags []string
 			var cfg pveConfig
 			if err := p.Client.do(ctx, http.MethodGet,
 				"/api2/json/nodes/"+p.Node+"/"+kind+"/"+id+"/config", nil, &cfg); err == nil {
 				order, down = parseStartup(cfg.Data.Startup)
+				tags = parseTags(cfg.Data.Tags)
 			}
 
 			out = append(out, core.Guest{
@@ -82,6 +84,7 @@ func (p *Proxmox) Guests(ctx context.Context) ([]core.Guest, error) {
 				Status: g.Status,
 				Order:  order,
 				Down:   down,
+				Tags:   tags,
 			})
 		}
 	}
@@ -92,7 +95,13 @@ func (p *Proxmox) Guests(ctx context.Context) ([]core.Guest, error) {
 type pveConfig struct {
 	Data struct {
 		Startup string `json:"startup"`
+		Tags    string `json:"tags"`
 	} `json:"data"`
+}
+
+// parseTags splits Proxmox's `tags` value, stored semicolon-separated.
+func parseTags(v string) []string {
+	return strings.FieldsFunc(v, func(r rune) bool { return r == ';' || r == ',' || r == ' ' })
 }
 
 // parseStartup reads Proxmox's `startup` value — "order=4,up=200,down=240".

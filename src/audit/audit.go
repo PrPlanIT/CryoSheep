@@ -34,6 +34,15 @@ const (
 	TriggerManual  = "manual"
 )
 
+// Verbs name what a run was asked to do, so the undo of a sleep can also find
+// the conserve that preceded it in the same outage.
+const (
+	VerbConserve = "conserve"
+	VerbSleep    = "sleep"
+	VerbCancel   = "cancel"
+	VerbWake     = "wake"
+)
+
 // Step outcomes.
 const (
 	OutcomeDone    = "done"
@@ -68,6 +77,7 @@ type line struct {
 	Host    string `json:"host"`
 	Trigger string `json:"trigger"`
 	Event   string `json:"ev"`
+	Verb    string `json:"verb,omitempty"` // run.start only
 
 	Step    int    `json:"step,omitempty"`
 	Action  string `json:"action,omitempty"`
@@ -108,7 +118,7 @@ type Log struct {
 // sees them, which would leave cancel and wake with no record of what to undo.
 // A run started by hand must be as reversible as one started by a unit, so when
 // stderr is not already going to the journal we send a copy there ourselves.
-func Open(host, trigger string) *Log {
+func Open(host, trigger, verb string) *Log {
 	out := io.Writer(os.Stderr)
 	var human io.Writer
 	var detach func()
@@ -122,7 +132,7 @@ func Open(host, trigger string) *Log {
 		}
 	}
 
-	l := open(out, journalSync, time.Now, host, trigger)
+	l := open(out, journalSync, time.Now, host, trigger, verb)
 	l.human, l.detach = human, detach
 	return l
 }
@@ -142,7 +152,7 @@ func journalPipe() (io.Writer, func(), bool) {
 	return w, func() { _ = w.Close(); _ = cmd.Wait() }, true
 }
 
-func open(out io.Writer, sync func() error, now func() time.Time, host, trigger string) *Log {
+func open(out io.Writer, sync func() error, now func() time.Time, host, trigger, verb string) *Log {
 	start := now()
 	l := &Log{
 		// The pid disambiguates two runs that begin in the same second — a
@@ -156,7 +166,7 @@ func open(out io.Writer, sync func() error, now func() time.Time, host, trigger 
 		sync:    sync,
 		now:     now,
 	}
-	l.write(line{Event: evRunStart})
+	l.write(line{Event: evRunStart, Verb: verb})
 	return l
 }
 

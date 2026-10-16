@@ -18,11 +18,7 @@ import (
 type Action string
 
 const (
-	// ActionUPSDeadline arms the UPS's own power-off timer. First, and
-	// reversible: it is armed while the UPS can still be reached, and cancelled
-	// if mains return before the host is committed.
-	ActionUPSDeadline Action = "ups.deadline.arm"
-	ActionCephNoout   Action = "ceph.noout.set"
+	ActionCephNoout Action = "ceph.noout.set"
 
 	// Node-local kubernetes teardown. Cordon and drain are reversible — an
 	// abandoned shutdown uncordons and the workloads return. Releasing mounts is
@@ -31,6 +27,7 @@ const (
 	ActionK8sCordon  Action = "k8s.cordon"
 	ActionK8sUnmount Action = "k8s.csi.unmount"
 	ActionGuestStop  Action = "guest.shutdown"
+	ActionUPSCut     Action = "ups.shutdown.return"
 	ActionHostHalt   Action = "host.poweroff"
 )
 
@@ -59,16 +56,23 @@ type Step struct {
 	// opposite policy — so the policy belongs in the plan, not in the executor
 	// and not in a second code path.
 	Wave int
+
+	// NotBefore holds the step's wave until this long after the sequence began,
+	// unless Clears is satisfied sooner. Zero means no hold.
+	NotBefore time.Duration
+
+	// Clears are the order ranges that must have no running guest anywhere in
+	// the estate for the hold to release early. Every host acts on the same
+	// signal, so a hold that only ever shortens keeps them in step.
+	Clears []OrderGroup
+
+	// After is the UPS cut's delay. Not a budget: the step itself is one command.
+	After time.Duration
 }
 
 type Options struct {
 	// GuestTimeout bounds each guest's ACPI shutdown before it is forced.
 	GuestTimeout time.Duration
-
-	// UPSDeadline is how long the UPS should wait before cutting power
-	// regardless of what the sequence managed to do. Zero omits the step, for a
-	// host with no authority over the UPS.
-	UPSDeadline time.Duration
 
 	// OrderGroups collapses spans of startup order into single waves, in the
 	// sequence declared. Empty means every tier is its own wave, which is the
@@ -117,6 +121,13 @@ type Options struct {
 	// it or, on a reboot, turns it into a poweroff and the machine never comes
 	// back. The teardown is still the whole point; ending it is not ours to do.
 	OmitHalt bool
+
+	// UPSCut is the delay sent with shutdown.return as the last step before the
+	// halt; zero sends nothing. Every host sends it at the same barrier, so the
+	// cut lands this long after the estate is down whichever command the UPS
+	// keeps. It is also what powers the hosts back on: a host that halted with
+	// mains present stays off until the output cycles.
+	UPSCut time.Duration
 }
 
 // AllAtOnce stops every guest in an order tier together. Negative rather than
@@ -136,9 +147,15 @@ const AllAtOnce = -1
 // but Kubernetes PVC traffic is routed through the firewall — so Kubernetes is
 // the only tier that needs other tiers still standing while it drains. Leaves
 // above it depend on nothing; the infrastructure below it is mutually
-// independent. Three groups, not five tiers.
+// independent.
+//
+// Order is per host, and the dependency is not: the routers on one node must
+// outlive kubelet on every node. NotBefore expresses that as time from the
+// shared signal — the group waits that long, or until no guest in an earlier
+// group is running anywhere in the estate, whichever comes first.
 type OrderGroup struct {
-	Lo, Hi int
+	Lo, Hi    int
+	NotBefore time.Duration
 }
 
 // unorderedOrder is the order an unordered guest counts as when grouping.
@@ -261,6 +278,17 @@ func orderOf(g core.Guest) int {
 	return g.Order
 }
 
+// Covers reports whether a guest's order falls in any of groups.
+func Covers(groups []OrderGroup, g core.Guest) bool {
+	o := orderOf(g)
+	for _, r := range groups {
+		if o >= r.Lo && o <= r.Hi {
+			return true
+		}
+	}
+	return false
+}
+
 // groupIndexOf returns which declared group a guest belongs to, or -1.
 func groupIndexOf(g core.Guest, groups []OrderGroup) int {
 	o := orderOf(g)
@@ -336,19 +364,6 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 		return false
 	}
 
-	// Arm the hardware backstop first, while the UPS is certainly still
-	// reachable. Everything after this can fail without the estate being left
-	// powered on until the battery is flat.
-	if opts.UPSDeadline > 0 {
-		p.Steps = append(p.Steps, Step{
-			Action:     ActionUPSDeadline,
-			Detail:     "UPS cuts power regardless of what follows",
-			Timeout:    opts.UPSDeadline,
-			Reversible: true,
-			Wave:       solo(),
-		})
-	}
-
 	// Stop the cluster reacting to a departure that is deliberate. Reversible,
 	// and first, so the abundant part of the budget is spent where it can be
 	// given back.
@@ -388,8 +403,14 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 		)
 	}
 
+	groups := usableGroups(opts.OrderGroups)
 	for _, group := range guestWaves(shutdownOrder(guests, opts.OrderGroups), opts.GuestConcurrency, opts.OrderGroups) {
 		w := solo()
+		var notBefore time.Duration
+		var clears []OrderGroup
+		if gi := groupIndexOf(group[0], groups); gi > 0 && groups[gi].NotBefore > 0 {
+			notBefore, clears = groups[gi].NotBefore, groups[:gi]
+		}
 		for _, g := range group {
 			// A guest that declares its own budget gets it. Proxmox already knows a
 			// firewall needs longer than a scratch VM; a flat timeout would make the
@@ -399,11 +420,13 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 				budget = g.Down
 			}
 			p.Steps = append(p.Steps, Step{
-				Action:  ActionGuestStop,
-				Target:  g.ID,
-				Detail:  g.Name,
-				Timeout: budget,
-				Wave:    w,
+				Action:    ActionGuestStop,
+				Target:    g.ID,
+				Detail:    g.Name,
+				Timeout:   budget,
+				Wave:      w,
+				NotBefore: notBefore,
+				Clears:    clears,
 				// Undoable: the guest can be started again. Gating every guest is
 				// what stops a recovered outage from becoming a real one — power
 				// back while the third of six is stopping must abandon the
@@ -414,6 +437,10 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 	}
 
 	if !opts.OmitHalt {
+		if opts.UPSCut > 0 {
+			p.Steps = append(p.Steps, Step{Action: ActionUPSCut, After: opts.UPSCut,
+				Detail: "output off in " + opts.UPSCut.String() + ", back on with utility power", Wave: solo()})
+		}
 		p.Steps = append(p.Steps, Step{Action: ActionHostHalt, Detail: host, Wave: solo()})
 	}
 	return p
@@ -425,17 +452,55 @@ func Build(host string, roles []core.Role, guests []core.Guest, upsStatus string
 // slowest member costs, not the sum of its members. Summing every step instead
 // overstates the ceiling exactly when concurrency has been configured correctly,
 // which teaches an operator to distrust the number at the moment it is right.
+//
+// Holds count at their ceiling: a wave starts no earlier than its NotBefore, and
+// the first committing step no earlier than HoldUntil. The early release only
+// ever shortens a run, so it has no place in a worst case.
 func (p Plan) WorstCase() time.Duration {
-	var total time.Duration
-	var wave, slowest = -1, time.Duration(0)
-	for _, s := range p.Steps {
-		if s.Wave != wave {
-			total += slowest
-			wave, slowest = s.Wave, 0
+	pnr := p.PointOfNoReturn()
+	var t time.Duration
+	for i := 0; i < len(p.Steps); {
+		start, slowest := p.Steps[i].NotBefore, time.Duration(0)
+		j := i
+		for ; j < len(p.Steps) && p.Steps[j].Wave == p.Steps[i].Wave; j++ {
+			if p.Steps[j].Timeout > slowest {
+				slowest = p.Steps[j].Timeout
+			}
 		}
-		if s.Timeout > slowest {
-			slowest = s.Timeout
+		if i <= pnr && pnr < j && p.HoldUntil > start {
+			start = p.HoldUntil
 		}
+		if start > t {
+			t = start
+		}
+		t += slowest
+		i = j
 	}
-	return total + slowest
+	return t
+}
+
+// Shed composes the reversible stop of this host's guests tagged TagShed.
+//
+// It is what `conserve` runs once an outage is confirmed: non-essential load
+// stops early to stretch the battery, and comes back if mains return. Nothing
+// else is touched — no cordon, no Ceph flag, no halt — so a recovered outage
+// costs only the guests somebody marked as expendable.
+func Shed(host string, guests []core.Guest, upsStatus string, opts Options) Plan {
+	opts = opts.withDefaults()
+	p := Plan{Host: host, UPSStatus: upsStatus}
+	for _, g := range guests {
+		if !g.Running() || !g.Tagged(core.TagShed) {
+			continue
+		}
+		p.Guests = append(p.Guests, g)
+		budget := opts.GuestTimeout
+		if g.Down > 0 {
+			budget = g.Down
+		}
+		p.Steps = append(p.Steps, Step{
+			Action: ActionGuestStop, Target: g.ID, Detail: g.Name,
+			Timeout: budget, Wave: 1, Reversible: true,
+		})
+	}
+	return p
 }
