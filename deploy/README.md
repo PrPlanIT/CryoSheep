@@ -5,11 +5,16 @@ it back on the way up. A third, `cryosheep@.service`, is started by NUT on a UPS
 event and is never enabled.
 
 ```
-install -m0755 cryosheep /usr/local/bin/cryosheep
-install -m0644 deploy/systemd/*.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now cryosheep-stasis.service cryosheep-wake.service
+cryosheep install        # newest release; --dev for the newest main build
+cryosheep update         # later: newest build on the same channel
+cryosheep remove         # disarm and remove
 ```
+
+`install` downloads the release for this machine's architecture, refuses it unless it
+matches the release's `SHA256SUMS`, writes `/usr/local/bin/cryosheep` and the units
+built into that binary, and enables the two below. Run it again and nothing changes.
+The first time, any `cryosheep` binary will do: unpack one from a release archive and
+run `./cryosheep install` from it.
 
 `cryosheep-stasis` does nothing at boot; its `ExecStop` is the whole point.
 Enabling it is what arms the teardown.
