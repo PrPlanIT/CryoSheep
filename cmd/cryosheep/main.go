@@ -41,6 +41,12 @@ func main() {
 		os.Exit(runWake(os.Args[2:]))
 	case "calibrate":
 		os.Exit(runCalibrate(os.Args[2:]))
+	case "install":
+		os.Exit(runInstall(os.Args[2:]))
+	case "update":
+		os.Exit(runUpdate(os.Args[2:]))
+	case "remove":
+		os.Exit(runRemove(os.Args[2:]))
 	case "version", "--version", "-v":
 		fmt.Printf("cryosheep %s (%s, built %s)\n", version.Version, version.Commit, version.BuildDate)
 	default:
@@ -59,6 +65,9 @@ func usage() {
   cancel     abandon a sleep and undo it          (upsmon NOTIFYCMD, ONLINE)
   wake       revive after stasis                  (on boot)
   calibrate  recommend a threshold from what past runs actually cost
+  install    install the newest release and arm its units  (--dev: newest main build)
+  update     move to the newest build on the installed channel
+  remove     disarm the units and remove the binary
   version    build identity
 
 `)
