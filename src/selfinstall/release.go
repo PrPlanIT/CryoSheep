@@ -17,7 +17,7 @@ import (
 )
 
 // DefaultSource is the primary forge's releases API for this project.
-const DefaultSource = "https://gitlab.prplanit.com/api/v4/projects/PrPlanIT%2FCryoSheep"
+const DefaultSource = "https://git.optcp.com/api/v4/projects/PrPlanIT%2FCryoSheep"
 
 // Channel selects which releases are eligible.
 type Channel string

@@ -1,6 +1,6 @@
 [Unit]
 Description=Revive this machine after stasis
-Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+Documentation=https://git.optcp.com/PrPlanIT/CryoSheep
 
 # Uncordoning needs the API server, so this waits for the network. On a node that
 # was cut mid-sequence there is nothing else that will do it: the machine comes

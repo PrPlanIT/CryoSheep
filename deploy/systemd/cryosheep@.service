@@ -1,6 +1,6 @@
 [Unit]
 Description=CryoSheep %i on a UPS event
-Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+Documentation=https://git.optcp.com/PrPlanIT/CryoSheep
 
 # Started by upsmon's SHUTDOWNCMD and upssched's CMDSCRIPT (`systemctl start
 # --no-block cryosheep@sleep.service`, @conserve, @cancel) rather than run by

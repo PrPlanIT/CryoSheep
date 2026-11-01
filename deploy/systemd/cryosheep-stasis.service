@@ -1,6 +1,6 @@
 [Unit]
 Description=Orderly stasis before this machine stops
-Documentation=https://gitlab.prplanit.com/PrPlanIT/CryoSheep
+Documentation=https://git.optcp.com/PrPlanIT/CryoSheep
 
 # Shutdown ordering is the reverse of startup ordering. Ordering *after* these at
 # boot is what makes this stop *before* them at shutdown — while the API server
